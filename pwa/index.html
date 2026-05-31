@@ -169,10 +169,10 @@ html, body {
 /* ── Cover rail ──────────────────────────────────────────────────── */
 .cover-rail {
   position: absolute;
-  left: calc(50% + 334px);
+  left: calc(50% + 434px);
   top: 50%;
-  width: 132px;
-  height: 392px;
+  width: 158px;
+  height: 470px;
   transform: translateY(-50%);
   display: grid;
   place-items: center;
@@ -200,9 +200,9 @@ html, body {
 .cover-slot {
   position: absolute;
   left: 50%;
-  width: 92px;
-  height: 92px;
-  border-radius: 12px;
+  width: 110px;
+  height: 110px;
+  border-radius: 14px;
   overflow: hidden;
   background: linear-gradient(145deg, rgb(36,36,40), rgb(12,12,14));
   box-shadow:
@@ -234,15 +234,15 @@ html, body {
     linear-gradient(145deg, rgb(38,39,44), rgb(14,14,16));
 }
 .cover-slot.previous {
-  top: 18px;
+  top: 22px;
   filter: grayscale(1) saturate(.15) brightness(.66);
   opacity: .56;
 }
 .cover-slot.current {
-  top: 132px;
-  width: 124px;
-  height: 124px;
-  border-radius: 16px;
+  top: 158px;
+  width: 149px;
+  height: 149px;
+  border-radius: 19px;
   transform: translateX(-50%) scale(1.08);
   box-shadow:
     rgba(0,0,0,.48) 0 30px 52px -18px,
@@ -254,7 +254,7 @@ html, body {
   transform: scale(1.08);
 }
 .cover-slot.next {
-  bottom: 18px;
+  bottom: 22px;
   filter: grayscale(1) saturate(.15) brightness(.66);
   opacity: .56;
 }
@@ -362,16 +362,16 @@ html, body {
 }
 .header-date {
   font-family: Doto, "IBM Plex Mono", monospace;
-  font-size: 13px; font-weight: 600; line-height: 1;
+  font-size: 13px; font-weight: 700; line-height: 1;
   letter-spacing: .02em;
-  color: rgb(98,226,255);
+  color: rgb(255,255,255);
   max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .header-calendar {
   font-family: Doto, "IBM Plex Mono", monospace;
-  font-size: 10px; font-weight: 600; line-height: 1;
+  font-size: 10px; font-weight: 700; line-height: 1;
   letter-spacing: .16em;
-  color: rgb(98,226,255);
+  color: rgb(255,255,255);
   text-transform: uppercase;
   max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
@@ -400,10 +400,9 @@ html, body {
 .meta { padding: 8px 28px 6px; display: flex; flex-direction: column; gap: 3px; }
 .meta-main {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  justify-content: start;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 10px;
+  gap: 14px;
 }
 .meta-copy {
   min-width: 0;
@@ -428,7 +427,7 @@ html, body {
 .meta-status {
   min-width: 0;
   display: flex;
-  justify-content: flex-start;
+  justify-content: flex-end;
 }
 .now-playing-title {
   display: none;
@@ -715,8 +714,7 @@ html, body {
     padding: 6px 20px 5px;
   }
   .meta-main {
-    grid-template-columns: auto minmax(0, 1fr);
-    justify-content: start;
+    grid-template-columns: minmax(0, 1fr) auto;
   }
   .meta-status {
     min-width: 0;
@@ -849,6 +847,7 @@ html, body {
       <div class="meta">
         <div class="session-title" id="sessionTitle"></div>
         <div class="meta-main">
+          <div class="now-playing-title" id="nowPlayingTitle"></div>
           <div class="meta-status">
             <div class="header-status">
               <span class="dot-live" id="dotLive" style="display:none"></span>
@@ -856,7 +855,6 @@ html, body {
               <button class="replay-btn" id="replayBtn" style="display:none">↩ replay</button>
             </div>
           </div>
-          <div class="now-playing-title" id="nowPlayingTitle"></div>
         </div>
         <div class="meta-sub">
           <span id="metaSub"></span>
@@ -1261,7 +1259,7 @@ syncFullscreenButton();
       if (playing) {
         // Keep the visualizer low so the clock stays visually dominant.
         const base = 0.04 + 0.06 * Math.abs(Math.sin(i * 0.19));
-        bar.target = (base + normalized * 0.342) * H;
+        bar.target = (base + normalized * 0.563) * H;
       } else {
         // Short idle ripple when paused
         bar.target = (0.02 + normalized * 0.06) * H;

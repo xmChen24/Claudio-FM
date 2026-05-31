@@ -84,6 +84,13 @@ const REFILL_TRACK_COUNT = 3;
 const PROGRAM_START_ID_TEXT = 'This is Claudio.';
 const TRACK_REPEAT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const ARTIST_RECENT_WINDOW = 5;
+const FALLBACK_PROGRAM_TRACKS = [
+  'Sweet Disposition - The Temper Trap',
+  'Ventura Highway - America',
+  'Pink Moon - Nick Drake',
+  '1901 - Phoenix',
+  'This Must Be the Place - Talking Heads',
+];
 const SPOTIFY_SCOPES = [
   'streaming',
   'user-read-email',
@@ -226,6 +233,51 @@ function programStartIdSegment(programId) {
     position: 'before_track',
     trackIndex: 0,
     text: PROGRAM_START_ID_TEXT,
+  };
+}
+
+function fallbackProgramStartResult(job = {}, reason = '') {
+  const djLanguage = normalizeDjLanguage(job.djLanguage);
+  const isZh = djLanguage === 'zh';
+  return {
+    title: isZh ? '午夜备用信号' : 'Emergency Night Signal',
+    play: FALLBACK_PROGRAM_TRACKS,
+    segments: isZh ? [
+      {
+        type: 'cold_open',
+        groupId: 'open_0',
+        part: 'anchor',
+        position: 'before_track',
+        trackIndex: 0,
+        text: '主线路刚才有点拥堵，Claudio 先切到一组稳定的夜间备用歌单。',
+      },
+      {
+        type: 'cold_open',
+        groupId: 'open_0',
+        part: 'invitation',
+        position: 'before_track',
+        trackIndex: 0,
+        text: '把音量放低一点，我们继续在空中发射。',
+      },
+    ] : [
+      {
+        type: 'cold_open',
+        groupId: 'open_0',
+        part: 'anchor',
+        position: 'before_track',
+        trackIndex: 0,
+        text: 'The main signal is congested, so Claudio is switching to a stable night backup set.',
+      },
+      {
+        type: 'cold_open',
+        groupId: 'open_0',
+        part: 'invitation',
+        position: 'before_track',
+        trackIndex: 0,
+        text: 'Keep it low and let the station drift back into the sky.',
+      },
+    ],
+    reason: reason ? `fallback: ${reason}` : 'fallback program start',
   };
 }
 
@@ -528,6 +580,7 @@ async function resolveRequestedTracks(requestedTracks, options = {}) {
   const tracks = [];
   const failedTracks = [];
   const avoidState = createTrackAvoidState(options.queue || []);
+  const enforceAvoidance = options.enforceAvoidance !== false;
   for (let i = 0; i < requestedTracks.length; i++) {
     const query = requestedTracks[i];
     const track = await getTrack(query);
@@ -550,11 +603,13 @@ async function resolveRequestedTracks(requestedTracks, options = {}) {
         album: track.album || '',
         durationMs: track.durationMs || 0,
       };
-      const skip = shouldSkipTrack(payloadTrack, avoidState);
-      if (skip.skip) {
-        failedTracks.push(`${query} (${skip.reason})`);
-        console.log(`[音乐] ↷ ${i + 1}/${requestedTracks.length} 跳过重复: ${payloadTrack.title}${payloadTrack.artist ? ' — ' + payloadTrack.artist : ''} | ${skip.reason}`);
-        continue;
+      if (enforceAvoidance) {
+        const skip = shouldSkipTrack(payloadTrack, avoidState);
+        if (skip.skip) {
+          failedTracks.push(`${query} (${skip.reason})`);
+          console.log(`[音乐] ↷ ${i + 1}/${requestedTracks.length} 跳过重复: ${payloadTrack.title}${payloadTrack.artist ? ' — ' + payloadTrack.artist : ''} | ${skip.reason}`);
+          continue;
+        }
       }
       tracks.push(payloadTrack);
       avoidState.batchTrackKeys.add(trackIdentity(payloadTrack));
@@ -643,8 +698,27 @@ async function runProgramStartJob(job) {
   const prompt = buildProgramStartPrompt(job.input || 'Open the station.', job.queueState || '', {
     djLanguage: job.djLanguage,
   });
-  const result = await callClaude(prompt);
-  const { tracks, failedTracks } = await resolveRequestedTracks(result.play || []);
+  let result;
+  try {
+    result = await callClaude(prompt);
+  } catch (err) {
+    console.warn(`[program_start] LLM unavailable, using fallback set: ${err.message}`);
+    broadcastSystemLog('warn', 'Starting fallback radio signal', { error: err.message });
+    result = fallbackProgramStartResult(job, err.message);
+  }
+
+  let { tracks, failedTracks } = await resolveRequestedTracks(result.play || []);
+  if (!tracks.length) {
+    console.warn('[program_start] No playable tracks from generated set; using fallback set.');
+    const fallbackResult = fallbackProgramStartResult(job, 'no playable generated tracks');
+    const fallbackResolved = await resolveRequestedTracks(fallbackResult.play, { enforceAvoidance: false });
+    if (fallbackResolved.tracks.length) {
+      result = fallbackResult;
+      tracks = fallbackResolved.tracks;
+      failedTracks = [...failedTracks, ...fallbackResolved.failedTracks];
+    }
+  }
+
   let coldOpenSegments = (result.segments || []).filter(segment => segment?.type === 'cold_open');
   let coldOpenReason = result.reason;
   if (tracks.length) {
@@ -654,9 +728,14 @@ async function runProgramStartJob(job) {
       userInput: job.input || 'Open the station.',
       djLanguage: job.djLanguage,
     });
-    const coldOpenScript = await callClaude(coldOpenPrompt);
-    coldOpenSegments = Array.isArray(coldOpenScript.segments) ? coldOpenScript.segments : coldOpenSegments;
-    coldOpenReason = coldOpenScript.reason || coldOpenReason;
+    try {
+      const coldOpenScript = await callClaude(coldOpenPrompt);
+      coldOpenSegments = Array.isArray(coldOpenScript.segments) ? coldOpenScript.segments : coldOpenSegments;
+      coldOpenReason = coldOpenScript.reason || coldOpenReason;
+    } catch (err) {
+      console.warn(`[program_start] Cold open LLM unavailable, using existing intro: ${err.message}`);
+      coldOpenReason = coldOpenReason || `cold open fallback: ${err.message}`;
+    }
   }
   const coldOpenResult = {
     ...result,
