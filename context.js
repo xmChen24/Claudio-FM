@@ -37,6 +37,21 @@ function normalizeDjLanguage(language) {
   return language === 'zh' ? 'zh' : 'en';
 }
 
+function normalizeHostMode(mode) {
+  return ['quiet', 'story', 'companion'].includes(mode) ? mode : 'story';
+}
+
+function hostModeInstruction(mode) {
+  const normalized = normalizeHostMode(mode);
+  if (normalized === 'quiet') {
+    return 'Host mode: Quiet. Speak sparingly, keep DJ lines short, and let the music carry the room.';
+  }
+  if (normalized === 'companion') {
+    return 'Host mode: Companion. Respond to the listener like a warm private radio host, while staying restrained and not chatty.';
+  }
+  return 'Host mode: Story. Add concise musical context, origin, texture, or scene-setting when it helps the track feel chosen.';
+}
+
 function djLanguageInstruction(language, scope = 'spoken segment text') {
   if (normalizeDjLanguage(language) === 'zh') {
     return `All ${scope} must be in natural, restrained Chinese. Keep song titles and artist names in their original language for accurate music search.`;
@@ -58,6 +73,7 @@ function bridgeLengthInstruction(language) {
 
 function buildPrompt(userInput, queueState = '', options = {}) {
   const djLanguage = normalizeDjLanguage(options.djLanguage);
+  const hostMode = normalizeHostMode(options.hostMode);
   const intentText = options.mode === 'speech-only'
     ? 'Intent: speech-only / no-music. Do not recommend, replace, or add songs. Return an empty play array and one immediate quick_touch segment only if Claudio should speak.'
     : 'Intent: music radio segment. Unless the user asked for one specific song, return a mini set of 2-3 playable songs.';
@@ -70,6 +86,7 @@ function buildPrompt(userInput, queueState = '', options = {}) {
     [
       'Strictly output JSON only, with no extra text.',
       djLanguageInstruction(djLanguage),
+      hostModeInstruction(hostMode),
       'The "title" should use the same language as the DJ narration.',
       'The "play" array may keep song titles and artist names in their original language for accurate music search.',
       'For speech-only / no-music requests, "play" must be [] and segments must not alter the queue.',
@@ -91,6 +108,7 @@ function buildPrompt(userInput, queueState = '', options = {}) {
 
 function buildProgramStartPrompt(userInput, queueState = '', options = {}) {
   const djLanguage = normalizeDjLanguage(options.djLanguage);
+  const hostMode = normalizeHostMode(options.hostMode);
   return [
     sharedContext(),
     queueState ? `# 当前队列状态\n${queueState}` : '',
@@ -99,6 +117,7 @@ function buildProgramStartPrompt(userInput, queueState = '', options = {}) {
     [
       'Strictly output JSON only, with no extra text.',
       djLanguageInstruction(djLanguage, 'cold_open segment text'),
+      hostModeInstruction(hostMode),
       'The "title" should use the same language as the DJ narration.',
       'Return only: title, play, segments, reason.',
       'The "play" array must contain 2-3 songs in "song title - artist" format. Keep original-language titles/artists for search.',
@@ -114,8 +133,9 @@ function buildProgramStartPrompt(userInput, queueState = '', options = {}) {
   ].filter(Boolean).join('\n\n');
 }
 
-function buildColdOpenForTracksPrompt({ programTitle = '', tracks = [], userInput = '', djLanguage = 'en' } = {}) {
+function buildColdOpenForTracksPrompt({ programTitle = '', tracks = [], userInput = '', djLanguage = 'en', hostMode = 'story' } = {}) {
   const normalizedLanguage = normalizeDjLanguage(djLanguage);
+  const normalizedHostMode = normalizeHostMode(hostMode);
   const trackText = tracks.length
     ? tracks.map((track, i) => `${i}. ${track.title || track.query}${track.artist ? ' — ' + track.artist : ''}`).join('\n')
     : '（无可播放歌曲）';
@@ -130,6 +150,7 @@ function buildColdOpenForTracksPrompt({ programTitle = '', tracks = [], userInpu
       'Strictly output JSON only, with no extra text.',
       'Return only: {"segments":[...],"reason":"internal reason"}.',
       djLanguageInstruction(normalizedLanguage, 'cold_open segment text'),
+      hostModeInstruction(normalizedHostMode),
       'The opening is for trackIndex 0 and must introduce the first confirmed playable track.',
       'If you mention a song title or artist, it must exactly be from the confirmed playable song list above.',
       'Do not mention or describe any song that is not in the confirmed playable song list.',
@@ -142,7 +163,8 @@ function buildColdOpenForTracksPrompt({ programTitle = '', tracks = [], userInpu
   ].filter(Boolean).join('\n\n');
 }
 
-function buildMusicRefillPrompt({ programTitle = '', currentTrack = null, queue = [], count = 3 } = {}) {
+function buildMusicRefillPrompt({ programTitle = '', currentTrack = null, queue = [], count = 3, hostMode = 'story' } = {}) {
+  const normalizedHostMode = normalizeHostMode(hostMode);
   const queueText = queue.length
     ? queue.map((t, i) => `${i + 1}. ${t.title || t.query}${t.artist ? ' — ' + t.artist : ''}`).join('\n')
     : '（当前队列为空）';
@@ -156,6 +178,7 @@ function buildMusicRefillPrompt({ programTitle = '', currentTrack = null, queue 
     [
       'Strictly output JSON only, with no extra text.',
       'Return only: {"play":["song - artist"],"reason":"internal reason"}.',
+      hostModeInstruction(normalizedHostMode),
       `Return ${count} songs unless the queue context makes fewer safer.`,
       'Do not include segments, say, intros, or listener-facing explanations.',
       'Keep song titles and artist names in original language for accurate search.',
@@ -166,8 +189,9 @@ function buildMusicRefillPrompt({ programTitle = '', currentTrack = null, queue 
   ].filter(Boolean).join('\n\n');
 }
 
-function buildBridgePrompt({ programTitle = '', afterTrack, beforeTrack, afterTrackIndex, beforeTrackIndex, recentLines = '', djLanguage = 'en' }) {
+function buildBridgePrompt({ programTitle = '', afterTrack, beforeTrack, afterTrackIndex, beforeTrackIndex, recentLines = '', djLanguage = 'en', hostMode = 'story' }) {
   const normalizedLanguage = normalizeDjLanguage(djLanguage);
+  const normalizedHostMode = normalizeHostMode(hostMode);
   const afterText = `${afterTrack?.title || afterTrack?.query || 'previous track'}${afterTrack?.artist ? ' — ' + afterTrack.artist : ''}`;
   const beforeText = `${beforeTrack?.title || beforeTrack?.query || 'next track'}${beforeTrack?.artist ? ' — ' + beforeTrack.artist : ''}`;
   return [
@@ -180,6 +204,7 @@ function buildBridgePrompt({ programTitle = '', afterTrack, beforeTrack, afterTr
     [
       'Strictly output JSON only, with no extra text.',
       djLanguageInstruction(normalizedLanguage, 'bridge segment text'),
+      hostModeInstruction(normalizedHostMode),
       'Return only {"segments":[...],"reason":"internal reason"}.',
       'Output either 1-3 sentence-level bridge segments OR one silence segment.',
       'For bridge segments, use the same groupId, position between_tracks, and exact afterTrackIndex/beforeTrackIndex provided.',

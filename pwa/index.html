@@ -467,6 +467,137 @@ html, body {
 .replay-btn { display: none !important; }
 .replay-btn:hover { color: rgba(255,255,255,.85); background: rgba(255,255,255,.1); }
 
+/* ── Station console ─────────────────────────────────────────────── */
+.station-console {
+  margin: 0 16px 10px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px 12px;
+  align-items: center;
+  padding: 8px;
+  background:
+    linear-gradient(rgba(255,255,255,.05) 1px, transparent 1px) 0 0 / 8px 8px,
+    linear-gradient(90deg, rgba(255,255,255,.05) 1px, transparent 1px) 0 0 / 8px 8px,
+    rgba(2,8,19,.78);
+  border: 2px solid rgba(98,226,255,.72);
+  box-shadow: rgba(98,226,255,.18) 0 0 18px inset;
+}
+.signal-row,
+.action-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.signal-badge,
+.session-card,
+.up-next {
+  font-family: Doto, "IBM Plex Mono", monospace;
+  color: rgba(255,255,255,.88);
+}
+.signal-badge {
+  flex: 0 0 auto;
+  min-width: 118px;
+  padding: 6px 8px;
+  border-left: 4px solid rgb(98,226,255);
+  background: rgba(98,226,255,.12);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  text-transform: uppercase;
+  color: rgb(98,226,255);
+}
+.signal-badge.backup {
+  border-left-color: rgb(255,207,95);
+  background: rgba(255,207,95,.14);
+  color: rgb(255,207,95);
+}
+.host-mode-control {
+  display: grid;
+  grid-template-columns: repeat(3, auto);
+  gap: 3px;
+  min-width: 0;
+}
+.host-mode-control button,
+.feedback-btn {
+  height: 25px;
+  border-radius: 0;
+  border: 2px solid rgba(255,255,255,.70);
+  background: rgba(0,0,0,.36);
+  color: rgba(255,255,255,.78);
+  font-family: Doto, "IBM Plex Mono", monospace;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  padding: 0 8px;
+  cursor: pointer;
+  box-shadow: rgba(98,226,255,.45) 2px 2px 0;
+}
+.host-mode-control button.active,
+.feedback-btn:hover {
+  background: rgb(98,226,255);
+  color: rgb(1,5,14);
+}
+.feedback-btn:disabled {
+  opacity: .45;
+  cursor: wait;
+}
+.action-row {
+  justify-content: flex-end;
+}
+.session-card {
+  grid-column: 1 / 2;
+  min-width: 0;
+  font-size: 10px;
+  line-height: 1.25;
+  color: rgba(255,255,255,.62);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.session-card strong {
+  color: rgb(255,207,95);
+  font-weight: 700;
+}
+.up-next {
+  grid-column: 2 / 3;
+  justify-self: end;
+  max-width: 260px;
+  min-width: 0;
+  font-size: 10px;
+  line-height: 1.25;
+  color: rgba(255,255,255,.70);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.up-next strong {
+  color: rgb(98,226,255);
+  font-weight: 700;
+}
+.station-notice {
+  grid-column: 1 / -1;
+  display: none;
+  min-width: 0;
+  padding: 6px 8px;
+  border-left: 4px solid rgb(255,207,95);
+  background: rgba(255,207,95,.10);
+  color: rgba(255,255,255,.78);
+  font-family: Doto, "IBM Plex Mono", monospace;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.25;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.station-notice.visible {
+  display: block;
+}
+.station-notice a {
+  color: rgb(98,226,255);
+  text-decoration: none;
+}
 
 /* ── Transcript ──────────────────────────────────────────────────── */
 .transcript-wrap {
@@ -722,6 +853,24 @@ html, body {
   .now-playing-title {
     font-size: 13px;
   }
+  .station-console {
+    grid-template-columns: 1fr;
+  }
+  .action-row,
+  .up-next {
+    justify-self: stretch;
+  }
+  .up-next {
+    grid-column: 1 / -1;
+    max-width: none;
+  }
+  .session-card {
+    grid-column: 1 / -1;
+  }
+  .host-mode-control {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    flex: 1 1 auto;
+  }
   .player {
     grid-template-columns: auto 1fr;
     gap: 8px;
@@ -769,22 +918,6 @@ html, body {
 #chat-send:active { transform: translate(3px, 3px); box-shadow: none; }
 #chat-send svg { width: 15px; height: 15px; }
 #chat-send:disabled { opacity: .4; cursor: not-allowed; }
-
-/* ── Hidden DJ language state ────────────────────────────────────── */
-.segmented {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 2px;
-  padding: 3px; border-radius: 999px;
-  background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.08);
-}
-.segmented button {
-  height: 30px; border: none; border-radius: 999px;
-  background: transparent; color: rgba(255,255,255,.58);
-  font: 600 12px/1 "Instrument Sans", sans-serif; cursor: pointer;
-  transition: background .15s, color .15s;
-}
-.segmented button.active {
-  background: rgba(255,255,255,.92); color: rgb(17,17,17);
-}
 
 @media (max-width: 920px) {
   .cover-rail { display: none; }
@@ -870,6 +1003,24 @@ html, body {
         </div>
       </div><!-- .meta -->
 
+      <div class="station-console" aria-label="Station controls">
+        <div class="signal-row">
+          <div class="signal-badge" id="signalBadge">Live Signal</div>
+          <div class="host-mode-control" id="hostModeControl" role="group" aria-label="Host mode">
+            <button type="button" data-mode="quiet">Quiet</button>
+            <button type="button" data-mode="story">Story</button>
+            <button type="button" data-mode="companion">Companion</button>
+          </div>
+        </div>
+        <div class="action-row">
+          <button type="button" class="feedback-btn" id="moreLikeBtn">More like this</button>
+          <button type="button" class="feedback-btn" id="changeVibeBtn">Change vibe</button>
+        </div>
+        <div class="session-card" id="sessionCard">No session yet</div>
+        <div class="up-next" id="upNext">Up next: standby</div>
+        <div class="station-notice" id="stationNotice"></div>
+      </div>
+
       <!-- Main player: Music -->
       <div class="player">
         <div class="player-controls" aria-label="Playback controls">
@@ -946,14 +1097,6 @@ html, body {
   </svg>
 </button>
 
-<!-- Tweaks -->
-<div class="tweaks" id="tweaks" hidden>
-  <div class="segmented" id="djLanguageControl" role="group" aria-label="DJ language">
-    <button type="button" data-lang="en" aria-pressed="true">English</button>
-    <button type="button" data-lang="zh" aria-pressed="false">中文</button>
-  </div>
-</div>
-
 <!-- Hidden audio elements -->
 <audio id="tts-audio" preload="auto"></audio>
 <audio id="music-audio" preload="auto"></audio>
@@ -987,18 +1130,24 @@ const nowPlayingTitle = document.getElementById('nowPlayingTitle');
 const metaSub    = document.getElementById('metaSub');
 const metaSource = document.getElementById('metaSource');
 const metaSourceText = document.getElementById('metaSourceText');
+const signalBadge = document.getElementById('signalBadge');
+const hostModeControl = document.getElementById('hostModeControl');
+const moreLikeBtn = document.getElementById('moreLikeBtn');
+const changeVibeBtn = document.getElementById('changeVibeBtn');
+const sessionCard = document.getElementById('sessionCard');
+const upNext = document.getElementById('upNext');
+const stationNotice = document.getElementById('stationNotice');
 const transcriptScroll = document.getElementById('transcriptScroll');
 const chatBar    = document.getElementById('chatBar');
 const chatInput  = document.getElementById('chat-input');
 const chatSend   = document.getElementById('chat-send');
 const fullscreenToggle = document.getElementById('fullscreenToggle');
 const emptyState = document.getElementById('emptyState');
-const inDjVolume = document.getElementById('inDjVolume');
-const inMusicVolume = document.getElementById('inMusicVolume');
-const lblDjVolume = document.getElementById('lblDjVolume');
-const lblMusicVolume = document.getElementById('lblMusicVolume');
-const djLanguageControl = document.getElementById('djLanguageControl');
 let djLanguage = localStorage.getItem('claudio:dj-language') === 'zh' ? 'zh' : 'en';
+let hostMode = ['quiet', 'story', 'companion'].includes(localStorage.getItem('claudio:host-mode'))
+  ? localStorage.getItem('claudio:host-mode')
+  : 'story';
+let currentSignalState = 'live';
 let djVolume = Number(localStorage.getItem('claudio:dj-volume') || 100) / 100;
 let baseMusicVolume = Number(localStorage.getItem('claudio:music-volume') || 100) / 100;
 let ducking = false;
@@ -1108,6 +1257,7 @@ function buildStartMessage() {
   return `It's ${time} on ${date} (${timeZone}).${weather} You're on air — open the station. Pick whatever fits the moment.`;
 }
 let startingRadio = false;
+let retuningStation = false;
 let spotifyPlayer = null;
 let spotifyDeviceId = '';
 let spotifyReady = false;
@@ -1119,21 +1269,78 @@ let spotifyTrackDurationMs = 0;
 let spotifyEndTimer = null;
 let spotifyProgressTimer = null;
 
-function syncDjLanguageControl() {
-  djLanguageControl.querySelectorAll('button').forEach(button => {
-    const active = button.dataset.lang === djLanguage;
+function syncHostModeControl() {
+  hostModeControl?.querySelectorAll('button').forEach(button => {
+    const active = button.dataset.mode === hostMode;
     button.classList.toggle('active', active);
     button.setAttribute('aria-pressed', String(active));
   });
 }
 
-function setDjLanguage(value) {
-  djLanguage = value === 'zh' ? 'zh' : 'en';
-  localStorage.setItem('claudio:dj-language', djLanguage);
-  syncDjLanguageControl();
+function setHostMode(value) {
+  hostMode = ['quiet', 'story', 'companion'].includes(value) ? value : 'story';
+  localStorage.setItem('claudio:host-mode', hostMode);
+  syncHostModeControl();
 }
 
-syncDjLanguageControl();
+function setSignalState(state = 'live') {
+  if (!signalBadge) return;
+  const backup = state === 'backup';
+  currentSignalState = backup ? 'backup' : 'live';
+  signalBadge.classList.toggle('backup', backup);
+  signalBadge.textContent = backup ? 'Backup Signal' : 'Live Signal';
+}
+
+function sessionTrackLabel(track) {
+  if (!track) return '';
+  const title = trackTitle(track);
+  return track.artist ? `${title} - ${track.artist}` : title;
+}
+
+function renderSessionCard({ signal = currentSignalState } = {}) {
+  if (!sessionCard) return;
+  const title = sessionTitleEl.textContent || 'Untitled signal';
+  const count = queue.length;
+  const current = sessionTrackLabel(queue[queueIdx]);
+  const signalText = signal === 'backup' ? 'Backup' : 'Live';
+  const titleEl = document.createElement('strong');
+  titleEl.textContent = title;
+  const details = ` · ${signalText} · ${hostMode} host · ${count} track${count === 1 ? '' : 's'}${current ? ` · now ${current}` : ''}`;
+  sessionCard.replaceChildren(titleEl, document.createTextNode(details));
+}
+
+function renderUpNext() {
+  if (!upNext) return;
+  const nextTracks = queue.slice(queueIdx + 1, queueIdx + 3).map(sessionTrackLabel).filter(Boolean);
+  const label = document.createElement('strong');
+  label.textContent = 'Up next:';
+  upNext.replaceChildren(
+    label,
+    document.createTextNode(nextTracks.length ? ` ${nextTracks.join(' / ')}` : ' tuning')
+  );
+}
+
+function renderStationContext(options = {}) {
+  renderSessionCard(options);
+  renderUpNext();
+}
+
+syncHostModeControl();
+
+function setStationNotice(message = '', link = null) {
+  if (!stationNotice) return;
+  stationNotice.classList.toggle('visible', Boolean(message));
+  stationNotice.replaceChildren();
+  if (!message) return;
+  stationNotice.appendChild(document.createTextNode(message));
+  if (link?.href && link?.label) {
+    stationNotice.appendChild(document.createTextNode(' · '));
+    const anchor = document.createElement('a');
+    anchor.href = link.href;
+    anchor.textContent = link.label;
+    stationNotice.appendChild(anchor);
+  }
+}
 
 /* ── Clock ────────────────────────────────────────────────────────── */
 updateEnvironmentUi();
@@ -1141,31 +1348,15 @@ syncEnvironment().then(() => requestEnvironmentLocation());
 setInterval(() => updateEnvironmentUi(), 10000);
 setInterval(() => syncEnvironment(), 10 * 60 * 1000);
 
-/* ── Volume controls ──────────────────────────────────────────────── */
-function pctLabel(v) {
-  return `${Math.round(v * 100)}%`;
-}
-
-function syncVolumeControls() {
+/* ── Volume ──────────────────────────────────────────────────────── */
+function initializeVolume() {
   ttsAudio.volume = djVolume;
-  if (inDjVolume) inDjVolume.value = Math.round(djVolume * 100);
-  if (lblDjVolume) lblDjVolume.textContent = pctLabel(djVolume);
-  if (inMusicVolume) inMusicVolume.value = Math.round(baseMusicVolume * 100);
-  if (lblMusicVolume) lblMusicVolume.textContent = pctLabel(baseMusicVolume);
   if (!ducking) setPlaybackVolume(baseMusicVolume);
-}
-
-function setDjVolume(value) {
-  djVolume = Math.max(0, Math.min(1, value));
-  localStorage.setItem('claudio:dj-volume', Math.round(djVolume * 100));
-  ttsAudio.volume = djVolume;
-  if (lblDjVolume) lblDjVolume.textContent = pctLabel(djVolume);
 }
 
 function setMusicVolume(value) {
   baseMusicVolume = Math.max(0, Math.min(1, value));
   localStorage.setItem('claudio:music-volume', Math.round(baseMusicVolume * 100));
-  if (lblMusicVolume) lblMusicVolume.textContent = pctLabel(baseMusicVolume);
   if (ducking) {
     setPlaybackVolume(duckedMusicVolume());
   } else {
@@ -1173,7 +1364,7 @@ function setMusicVolume(value) {
   }
 }
 
-syncVolumeControls();
+initializeVolume();
 
 function setPlaybackVolume(value) {
   const volume = Math.max(0, Math.min(1, value));
@@ -1387,7 +1578,10 @@ async function fetchSpotifyToken() {
   const res = await fetch('/api/spotify/token');
   if (res.status === 401) {
     const body = await res.json().catch(() => ({}));
-    metaSub.innerHTML = `Spotify authorization required · <a href="${body.authUrl || '/auth/spotify'}">Connect</a>`;
+    setStationNotice('Spotify authorization required', {
+      href: body.authUrl || '/auth/spotify',
+      label: 'Connect',
+    });
     return null;
   }
   if (!res.ok) throw new Error(await res.text());
@@ -1418,12 +1612,12 @@ function initSpotifyPlayerWhenReady() {
   spotifyPlayer.addListener('initialization_error', ({ message }) => console.error('[spotify]', message));
   spotifyPlayer.addListener('authentication_error', ({ message }) => {
     spotifyReady = false;
-    metaSub.innerHTML = 'Spotify authorization required · <a href="/auth/spotify">Connect</a>';
+    setStationNotice('Spotify authorization required', { href: '/auth/spotify', label: 'Connect' });
     console.error('[spotify]', message);
   });
   spotifyPlayer.addListener('account_error', ({ message }) => {
     spotifyReady = false;
-    metaSub.textContent = 'Spotify Premium is required for web playback';
+    setStationNotice('Spotify Premium is required for web playback');
     console.error('[spotify]', message);
   });
   spotifyPlayer.addListener('player_state_changed', state => {
@@ -1845,6 +2039,7 @@ let handledSegmentIds = new Set();
 let programClockStartedAt = null;
 let currentProgramId = null;
 let lastRefillAt = 0;
+renderStationContext();
 
 function segmentKey(segment) {
   if (!segment) return '';
@@ -2047,6 +2242,7 @@ function renderQueue() {
     if (coverRail) coverRail.classList.remove('visible', 'rolling');
     if (coverStrip) coverStrip.replaceChildren();
     coverRenderKey = '';
+    renderStationContext();
     return;
   }
 
@@ -2071,6 +2267,7 @@ function renderQueue() {
     coverRollTimer = setTimeout(() => coverRail.classList.remove('rolling'), 520);
   }
   coverRenderKey = nextKey;
+  renderStationContext();
 }
 
 function trackCoverUrl(track) {
@@ -2146,6 +2343,7 @@ function autoRefill() {
       queue: queue.map(({ query, title, artist }) => ({ query, title, artist })),
       queueLength: queue.length,
       djLanguage,
+      hostMode,
     }),
   })
     .catch(err => {
@@ -2179,6 +2377,7 @@ async function playTrack(track) {
       spotifyTrackDurationMs = Number(track.durationMs || 0);
       spotifyTrackPositionMs = 0;
       spotifyTrackStartedAt = Date.now();
+      setStationNotice('');
       await fetch('/api/spotify/play', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2201,12 +2400,15 @@ async function playTrack(track) {
   spotifyActive = false;
   clearSpotifyTimers();
   if (!track.streamUrl) {
-    metaSub.innerHTML = track.spotifyUri
-      ? 'Spotify playback is not ready · <a href="/auth/spotify">Connect</a>'
-      : 'No playable audio source';
+    if (track.spotifyUri) {
+      setStationNotice('Spotify playback is not ready', { href: '/auth/spotify', label: 'Connect' });
+    } else {
+      setStationNotice('No playable audio source');
+    }
     setRadioStatus('Paused');
     return;
   }
+  setStationNotice('');
   musicAudio.src = track.streamUrl;
   setPlaybackVolume((!ttsAudio.paused && !ttsAudio.ended) ? duckedMusicVolume() : baseMusicVolume);
   musicAudio.play().catch(console.error);
@@ -2327,12 +2529,14 @@ function connectWS() {
 function handleWsMessage(msg) {
   if (msg.type === 'system-log') {
     addSystemLine(msg.message || 'system event');
+    if (/fallback|backup/i.test(msg.message || '')) setSignalState('backup');
     return;
   }
 
   if (msg.type === 'program-start') {
     currentProgramId = msg.programId || currentProgramId;
     if (msg.sessionTitle) sessionTitleEl.textContent = msg.sessionTitle;
+    setSignalState(msg.signal === 'backup' ? 'backup' : 'live');
     if (msg.stationName || msg.programName) {
       metaSub.textContent = [msg.stationName, msg.programName].filter(Boolean).join(' · ');
     }
@@ -2341,6 +2545,7 @@ function handleWsMessage(msg) {
     const incomingSegments = offsetSegmentsForQueue(normalizeIncomingSegments(msg), queue.length);
     scriptSegments = [...scriptSegments, ...incomingSegments];
     if (tracks.length) enqueueAndPlay(tracks);
+    renderStationContext({ signal: msg.signal === 'backup' ? 'backup' : 'live' });
     const immediateSegments = findSegments(segment =>
       segment.position === 'immediate' ||
       (segment.position === 'before_track' && (segment.trackIndex ?? 0) === queueIdx)
@@ -2353,6 +2558,7 @@ function handleWsMessage(msg) {
     currentProgramId = msg.programId || currentProgramId;
     autoRefilling = false;
     if (msg.tracks?.length) enqueueAndPlay(msg.tracks);
+    renderStationContext();
     return;
   }
 
@@ -2383,6 +2589,7 @@ function handleWsMessage(msg) {
 
   if (msg.type === 'now-playing') {
     if (msg.sessionTitle) sessionTitleEl.textContent = msg.sessionTitle;
+    setSignalState(msg.signal === 'backup' ? 'backup' : 'live');
     if (msg.stationName || msg.programName) {
       metaSub.textContent = [msg.stationName, msg.programName].filter(Boolean).join(' · ');
     }
@@ -2412,11 +2619,13 @@ function handleWsMessage(msg) {
       if (tracks.length) {
         enqueueAndPlay(tracks);
       }
+      renderStationContext({ signal: msg.signal === 'backup' ? 'backup' : 'live' });
     } else {
       // Fresh start (talk-up over the opening track) or a live call-in: act now.
       if (!musicLive) resetProgramClock();
       scriptSegments = [...scriptSegments, ...incomingSegments];
       if (tracks.length) enqueueAndPlay(tracks);
+      renderStationContext({ signal: msg.signal === 'backup' ? 'backup' : 'live' });
       const immediateSegments = findSegments(segment =>
         segment.position === 'immediate' ||
         (segment.position === 'before_track' && (segment.trackIndex ?? 0) === queueIdx)
@@ -2447,11 +2656,35 @@ connectWS();
 /* ── Chat ─────────────────────────────────────────────────────────── */
 async function requestChat(message, { showUserTurn = true } = {}) {
   if (showUserTurn) addUserTurn(message);
-  await fetch('/api/chat', {
+  const res = await fetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message, djLanguage }),
+    body: JSON.stringify({ message, djLanguage, hostMode }),
   });
+  if (!res.ok) throw new Error(await res.text());
+}
+
+async function requestVibeShift(kind) {
+  if (startingRadio || retuningStation) return;
+  retuningStation = true;
+  if (moreLikeBtn) moreLikeBtn.disabled = true;
+  if (changeVibeBtn) changeVibeBtn.disabled = true;
+  const current = queue[queueIdx];
+  const currentText = current ? sessionTrackLabel(current) : 'the current station mood';
+  const message = kind === 'more'
+    ? `More like this: keep the next set close to ${currentText}, but avoid repeating the same artist.`
+    : `Change the vibe: move away from ${currentText} and retune the station in a fresh direction.`;
+  addSystemLine(kind === 'more' ? 'Tuning more like this…' : 'Changing the station vibe…');
+  try {
+    await requestChat(message, { showUserTurn: true });
+  } catch (err) {
+    console.error('[vibe-shift]', err);
+    addSystemLine('Could not retune Claudio FM');
+  } finally {
+    retuningStation = false;
+    if (moreLikeBtn) moreLikeBtn.disabled = false;
+    if (changeVibeBtn) changeVibeBtn.disabled = false;
+  }
 }
 
 async function patchCallerIntoStation(text) {
@@ -2516,23 +2749,15 @@ chatInput.addEventListener('input', () => {
 });
 chatSend.addEventListener('click', sendMessage);
 
-if (inDjVolume) {
-  inDjVolume.addEventListener('input', () => {
-    setDjVolume(Number(inDjVolume.value) / 100);
-  });
-}
-
-if (inMusicVolume) {
-  inMusicVolume.addEventListener('input', () => {
-    setMusicVolume(Number(inMusicVolume.value) / 100);
-  });
-}
-
-djLanguageControl.addEventListener('click', e => {
-  const button = e.target.closest('button[data-lang]');
+hostModeControl?.addEventListener('click', e => {
+  const button = e.target.closest('button[data-mode]');
   if (!button) return;
-  setDjLanguage(button.dataset.lang);
+  setHostMode(button.dataset.mode);
+  renderStationContext();
 });
+
+moreLikeBtn?.addEventListener('click', () => requestVibeShift('more'));
+changeVibeBtn?.addEventListener('click', () => requestVibeShift('change'));
 </script>
 </body>
 </html>

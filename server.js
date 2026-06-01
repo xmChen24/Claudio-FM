@@ -115,6 +115,10 @@ function normalizeDjLanguage(value) {
   return value === 'zh' ? 'zh' : 'en';
 }
 
+function normalizeHostMode(value) {
+  return ['quiet', 'story', 'companion'].includes(value) ? value : 'story';
+}
+
 function ensureDirForFile(filePath) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
 }
@@ -664,7 +668,7 @@ async function runJob(job) {
   throw new Error(`Unknown job type: ${job.type}`);
 }
 
-function enqueueBridgeJobs({ programId, sessionTitle, tracks, startIndex = 0, previousTrack = null, previousIndex = null, djLanguage = 'en' }) {
+function enqueueBridgeJobs({ programId, sessionTitle, tracks, startIndex = 0, previousTrack = null, previousIndex = null, djLanguage = 'en', hostMode = 'story' }) {
   if (previousTrack && tracks.length) {
     enqueueJob({
       type: 'bridge_generation',
@@ -676,6 +680,7 @@ function enqueueBridgeJobs({ programId, sessionTitle, tracks, startIndex = 0, pr
       afterTrackIndex: previousIndex,
       beforeTrackIndex: startIndex,
       djLanguage: normalizeDjLanguage(djLanguage),
+      hostMode: normalizeHostMode(hostMode),
     });
   }
   for (let i = 1; i < tracks.length; i++) {
@@ -689,14 +694,17 @@ function enqueueBridgeJobs({ programId, sessionTitle, tracks, startIndex = 0, pr
       afterTrackIndex: startIndex + i - 1,
       beforeTrackIndex: startIndex + i,
       djLanguage: normalizeDjLanguage(djLanguage),
+      hostMode: normalizeHostMode(hostMode),
     });
   }
 }
 
 async function runProgramStartJob(job) {
   const programId = makeProgramId();
+  let backupSignal = false;
   const prompt = buildProgramStartPrompt(job.input || 'Open the station.', job.queueState || '', {
     djLanguage: job.djLanguage,
+    hostMode: job.hostMode,
   });
   let result;
   try {
@@ -705,6 +713,7 @@ async function runProgramStartJob(job) {
     console.warn(`[program_start] LLM unavailable, using fallback set: ${err.message}`);
     broadcastSystemLog('warn', 'Starting fallback radio signal', { error: err.message });
     result = fallbackProgramStartResult(job, err.message);
+    backupSignal = true;
   }
 
   let { tracks, failedTracks } = await resolveRequestedTracks(result.play || []);
@@ -716,6 +725,7 @@ async function runProgramStartJob(job) {
       result = fallbackResult;
       tracks = fallbackResolved.tracks;
       failedTracks = [...failedTracks, ...fallbackResolved.failedTracks];
+      backupSignal = true;
     }
   }
 
@@ -727,6 +737,7 @@ async function runProgramStartJob(job) {
       tracks,
       userInput: job.input || 'Open the station.',
       djLanguage: job.djLanguage,
+      hostMode: job.hostMode,
     });
     try {
       const coldOpenScript = await callClaude(coldOpenPrompt);
@@ -762,10 +773,11 @@ async function runProgramStartJob(job) {
     programName: PROGRAM_NAME,
     failedTracks,
     reason: coldOpenReason,
+    signal: backupSignal ? 'backup' : 'live',
   };
   broadcast(payload);
 
-  enqueueBridgeJobs({ programId, sessionTitle: result.title || '', tracks, startIndex: 0, djLanguage: job.djLanguage });
+  enqueueBridgeJobs({ programId, sessionTitle: result.title || '', tracks, startIndex: 0, djLanguage: job.djLanguage, hostMode: job.hostMode });
   return payload;
 }
 
@@ -777,6 +789,7 @@ async function runMusicRefillJob(job) {
     currentTrack: job.currentTrack,
     queue,
     count: job.count || REFILL_TRACK_COUNT,
+    hostMode: job.hostMode,
   });
   const result = await callClaude(prompt);
   const { tracks, failedTracks } = await resolveRequestedTracks(result.play || [], { queue });
@@ -797,7 +810,7 @@ async function runMusicRefillJob(job) {
     reason: result.reason,
   };
   broadcast(payload);
-  enqueueBridgeJobs({ programId, sessionTitle: stationState.sessionTitle, tracks, startIndex, previousTrack, previousIndex, djLanguage: job.djLanguage });
+  enqueueBridgeJobs({ programId, sessionTitle: stationState.sessionTitle, tracks, startIndex, previousTrack, previousIndex, djLanguage: job.djLanguage, hostMode: job.hostMode });
   return payload;
 }
 
@@ -809,6 +822,7 @@ async function runBridgeGenerationJob(job) {
     afterTrackIndex: job.afterTrackIndex,
     beforeTrackIndex: job.beforeTrackIndex,
     djLanguage: job.djLanguage,
+    hostMode: job.hostMode,
   });
   const result = await callClaude(prompt);
   let segments = await synthesizeSegments(normalizeSegments(
@@ -850,6 +864,7 @@ async function runRadioSegment(userInput, intent = {}, skipHistory = false) {
   const prompt = buildPrompt(userInput, nowPlaying ? JSON.stringify(nowPlaying) : '', {
     mode: intent.mode,
     djLanguage: intent.djLanguage,
+    hostMode: intent.hostMode,
   });
   const speechOnly = intent.mode === 'speech-only';
   const result = await callClaude(prompt);
@@ -908,12 +923,13 @@ async function handleClaudeRequest(userInput, res, intent = {}, skipHistory = fa
 
 // ── HTTP Routes ──────────────────────────────────────────────────────────────
 app.post('/api/chat', async (req, res) => {
-  const { message, autoRefill, djLanguage } = req.body;
+  const { message, autoRefill, djLanguage, hostMode } = req.body;
   if (!message) return res.status(400).json({ error: 'message required' });
 
   const intent = route(message);
   intent.source = autoRefill ? 'autoRefill' : 'user';
   intent.djLanguage = normalizeDjLanguage(djLanguage);
+  intent.hostMode = normalizeHostMode(hostMode);
 
   if (intent.action === 'next') {
     broadcast({ type: 'control', action: 'next' });
@@ -939,6 +955,7 @@ app.post('/api/chat', async (req, res) => {
       input: intent.message,
       source: autoRefill ? 'autoRefill' : 'user',
       djLanguage: intent.djLanguage,
+      hostMode: intent.hostMode,
     });
     return res.json({ queued: true, jobType: 'program_start' });
   }
@@ -956,6 +973,7 @@ app.post('/api/radio/refill', (req, res) => {
     queue = [],
     queueLength,
     djLanguage,
+    hostMode,
   } = req.body || {};
   const effectiveProgramId = programId || stationState.programId || makeProgramId();
   const effectiveQueueLength = Number.isInteger(queueLength) ? queueLength : Array.isArray(queue) ? queue.length : stationState.tracks.length;
@@ -972,6 +990,7 @@ app.post('/api/radio/refill', (req, res) => {
     queueLength: effectiveQueueLength,
     count: REFILL_TRACK_COUNT,
     djLanguage: normalizeDjLanguage(djLanguage),
+    hostMode: normalizeHostMode(hostMode),
   });
   res.json({ queued: accepted, jobType: 'music_refill', programId: effectiveProgramId });
 });
