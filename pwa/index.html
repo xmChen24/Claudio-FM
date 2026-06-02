@@ -1905,7 +1905,11 @@ function addTurn(speaker, text, timeLabel = 'now') {
 
   const head = document.createElement('div');
   head.className = 'turn-head';
-  head.innerHTML = `<span class="who">${speaker}</span> · ${displayTime}`;
+  const who = document.createElement('span');
+  who.className = 'who';
+  who.textContent = speaker;
+  head.appendChild(who);
+  head.appendChild(document.createTextNode(` · ${displayTime}`));
   turn.appendChild(head);
 
   const body = document.createElement('div');
@@ -2014,9 +2018,24 @@ function addUserTurn(text) {
   if (emptyState) emptyState.remove();
   const turn = document.createElement('div');
   turn.className = 'turn';
-  turn.innerHTML = `
-    <div class="turn-head"><span class="who">You</span> · now</div>
-    <div class="turn-body"><span class="word said">${text.replace(/</g,'&lt;')}</span></div>`;
+
+  const head = document.createElement('div');
+  head.className = 'turn-head';
+  const who = document.createElement('span');
+  who.className = 'who';
+  who.textContent = 'You';
+  head.appendChild(who);
+  head.appendChild(document.createTextNode(' · now'));
+
+  const body = document.createElement('div');
+  body.className = 'turn-body';
+  const word = document.createElement('span');
+  word.className = 'word said';
+  word.textContent = text;
+  body.appendChild(word);
+
+  turn.appendChild(head);
+  turn.appendChild(body);
   transcriptScroll.insertBefore(turn, transcriptScroll.lastElementChild);
   scrollTranscriptToBottom();
 }

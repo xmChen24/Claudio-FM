@@ -15,12 +15,83 @@ const { addPlay, addMessage, recentPlays, getPref } = require('./state');
 const { environmentSnapshot, updateEnvironment } = require('./env-context');
 const scheduler = require('./scheduler');
 
+const PORT = Number(process.env.PORT || 8080);
+const HOST = process.env.CLAUDIO_HOST || process.env.HOST || '127.0.0.1';
+const ALLOWED_ORIGINS = new Set(
+  (process.env.CLAUDIO_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(origin => normalizedOrigin(origin.trim()))
+    .filter(Boolean)
+);
+const TTS_CACHE_DIR = path.resolve(__dirname, 'cache/tts');
+const TTS_CACHE_FILENAME = /^[a-f0-9]{32}\.(mp3|wav)$/i;
+
+function normalizedOrigin(value) {
+  try {
+    const url = new URL(value);
+    return `${url.protocol}//${url.host}`;
+  } catch {
+    return '';
+  }
+}
+
+function isLoopbackHost(hostname) {
+  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]' || hostname === '::1';
+}
+
+function isTrustedOrigin(value) {
+  if (!value) return true;
+  const origin = normalizedOrigin(value);
+  if (!origin) return false;
+  if (ALLOWED_ORIGINS.has(origin)) return true;
+
+  try {
+    const url = new URL(origin);
+    const port = url.port || (url.protocol === 'https:' ? '443' : '80');
+    return (url.protocol === 'http:' || url.protocol === 'https:') &&
+      isLoopbackHost(url.hostname) &&
+      port === String(PORT);
+  } catch {
+    return false;
+  }
+}
+
+function isTrustedLocalRequest(req) {
+  if (req.headers.origin) return isTrustedOrigin(req.headers.origin);
+  if (req.headers.referer && !isTrustedOrigin(req.headers.referer)) return false;
+  return req.headers['sec-fetch-site'] !== 'cross-site';
+}
+
+function requireTrustedLocalRequest(req, res, next) {
+  if (isTrustedLocalRequest(req)) return next();
+  return res.status(403).json({ error: 'forbidden_origin' });
+}
+
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/stream' });
+const wss = new WebSocketServer({
+  server,
+  path: '/stream',
+  verifyClient: ({ req, origin }, done) => {
+    done(isTrustedLocalRequest({
+      headers: {
+        ...req.headers,
+        origin,
+      },
+    }), 403, 'Forbidden');
+  },
+});
 
-app.use(express.json());
+app.disable('x-powered-by');
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'same-origin');
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+  next();
+});
 app.use(express.static(path.join(__dirname, 'pwa')));
+app.use(['/api', '/auth'], requireTrustedLocalRequest);
+app.use(express.json());
 
 // ── WebSocket broadcast ──────────────────────────────────────────────────────
 const clients = new Set();
@@ -1008,7 +1079,7 @@ app.post('/api/environment', async (req, res) => {
   res.json(await environmentSnapshot({ refreshWeather: true }));
 });
 
-app.get('/api/next', async (req, res) => {
+app.post('/api/next', async (req, res) => {
   broadcast({ type: 'control', action: 'next' });
   res.json({ action: 'next' });
 });
@@ -1142,7 +1213,9 @@ app.post('/api/tts/caller', async (req, res) => {
 
 // Serve cached TTS files
 app.get('/api/tts/:filename', (req, res) => {
-  const file = path.join(__dirname, 'cache/tts', req.params.filename);
+  if (!TTS_CACHE_FILENAME.test(req.params.filename)) return res.status(404).end();
+  const file = path.resolve(TTS_CACHE_DIR, req.params.filename);
+  if (!file.startsWith(`${TTS_CACHE_DIR}${path.sep}`)) return res.status(404).end();
   if (!fs.existsSync(file)) return res.status(404).end();
   res.sendFile(file);
 });
@@ -1154,8 +1227,7 @@ function cryptoRandomState() {
 // ── Boot ─────────────────────────────────────────────────────────────────────
 scheduler.init(broadcast, runRadioSegment);
 
-const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => {
-  console.log(`\n[电台] Claudio FM 启动 → http://localhost:${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`\n[电台] Claudio FM 启动 → http://${HOST}:${PORT}`);
   console.log(`[电台] 等待调度器或用户触发…\n`);
 });
