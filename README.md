@@ -4,7 +4,7 @@
 
 It acts like a real DJ: it chooses music, speaks on air, bridges between songs, and keeps the station going based on your taste and the current moment.
 
-Claudio is not a playlist generator or a chatbot that waits for commands. Open it, press play, and it begins programming a small radio show for you. It reads the hour, remembers your recent listening, follows your music taste, and turns each DJ line into spoken audio before the next song comes in.
+Claudio is not a playlist generator or a chatbot that waits for commands. Open it, press play, and it begins programming a small radio show for you. It reads the local time, remembers your recent listening, follows your music taste, and turns each DJ line into spoken audio before the next song comes in.
 
 ## Preview
 
@@ -23,12 +23,15 @@ You can also call into the station through the request line. Claudio can play a 
 - Chooses songs based on your taste and the current time.
 - Opens a set with DJ narration.
 - Takes listener calls through the request line.
+- Distinguishes music requests, feedback, corrections, session context, and ordinary chat.
+- Learns from explicit feedback such as liking the current track, avoiding an artist, or asking the DJ to speak less.
 - Speaks in short, separate radio segments.
 - Bridges between songs like a live host.
 - Turns DJ lines into voice with TTS.
 - Keeps music buffered so the station can continue.
 - Lets you choose whether the DJ speaks English or Chinese.
 - Lets you control DJ voice volume and music volume separately.
+- Does not request browser location or call a weather API; the runtime context is local time and locale only.
 
 ## Why It Is Different
 
@@ -73,7 +76,7 @@ VOLCENGINE_TTS_VOICE_TYPE=en_female_nadia_tips_emo_v2_mars_bigtts
 - Activate and get the Doubao Speech API key from [Volcengine Speech Settings](https://console.volcengine.com/speech/new/setting/activate?ResourceID=volc.service_type.10029&projectName=default).
 - Doubao Speech currently includes 20,000 free characters for the 1.0 voice model and 20,000 free characters for the 2.0 voice model.
 
-### Optional Providers
+### Optional Providers And Reliability
 
 Spotify can be used for music metadata and Web Playback SDK playback. Set these values if you want Spotify support:
 
@@ -86,7 +89,7 @@ SPOTIFY_REDIRECT_URI=http://127.0.0.1:8080/auth/spotify/callback
 
 Then open `http://localhost:8080/auth/spotify` once to connect your Spotify account. Spotify playback requires Spotify Premium. Claudio stores the local Spotify token under `data/spotify/`, which is ignored by Git.
 
-Kokoro can be used as a local TTS sidecar:
+Kokoro can be used as a local TTS sidecar. `yarn start` starts it automatically when `TTS_PROVIDER=kokoro`; you can also run it manually:
 
 ```bash
 yarn kokoro:start
@@ -96,7 +99,24 @@ npm run kokoro:start
 
 Then set `TTS_PROVIDER=kokoro` or `CALLER_TTS_PROVIDER=kokoro` in `.env`.
 
-Gemini can be used as an OpenAI-compatible LLM provider by setting `LLM_PROVIDER=gemini` and `GEMINI_API_KEY`.
+Gemini can be used as an OpenAI-compatible LLM provider by setting `LLM_PROVIDER=gemini` and `GEMINI_API_KEY`. LLM calls retry transient failures such as 503s, then try the comma-separated providers in `LLM_FALLBACK_PROVIDERS`. The default fallback is `claude_cli`, which requires the `claude` command to be installed and authenticated.
+
+Useful reliability and latency knobs:
+
+```bash
+LLM_RETRIES=2
+LLM_RETRY_DELAY_MS=1200
+LLM_FALLBACK_PROVIDERS=claude_cli
+MUSIC_RESOLVE_CONCURRENCY=3
+DIRECT_ARTIST_TRACK_COUNT=3
+SPOTIFY_FAST_START=0
+TTS_SYNTH_CONCURRENCY=3
+TTS_SYNTH_RETRIES=2
+```
+
+Track lookup and TTS synthesis run with small bounded concurrency. Result ordering and queue de-duplication still follow the original requested track order.
+Set `SPOTIFY_FAST_START=1` only when Spotify Web Playback is connected and preferred; Claudio will skip yt-dlp stream fallback for Spotify hits so music can start from the Spotify URI faster.
+Direct artist requests such as `Drake` or `play Drake songs` search Spotify track results and enqueue up to `DIRECT_ARTIST_TRACK_COUNT` tracks whose artist field matches the requested artist. Bare inputs like `HUMBLE` fall through to song-title search when no artist-matching tracks are found.
 
 Start Claudio:
 
@@ -109,6 +129,38 @@ On startup, Claudio checks the local NeteaseCloudMusicApi sidecar. If
 a Netease QR login page at `data/netease/qr-login.html`. Scan it with the
 Netease Cloud Music app to save a local cookie for later runs. The saved cookie
 stays under `data/netease/` and is ignored by Git.
+
+The app also syncs the browser time zone and locale to `/api/environment`. That endpoint intentionally returns time context only; it does not store coordinates, browser geolocation, or weather.
+
+### DJ Personalization
+
+Claudio keeps static taste guidance in `user/taste.md`, `user/routines.md`, and `user/mood-rules.md`.
+
+At runtime, Claudio can also create `user/dj-memory.json` from explicit listener signals:
+
+- `这首歌不错` / `this track is good` can mark the current track and artist as liked.
+- `这首歌不好听` / `not this track` can mark the current track as disliked.
+- `别播这个歌手` / `do not play this artist` can add an artist avoidance signal.
+- `我在工作`, `有点累`, or `I had a rough day` can shape the current session tone.
+- `少说点` / `less talking` can make the DJ speak more sparsely.
+
+`user/dj-memory.json` is ignored by Git because it is private local listening data. You can inspect the current runtime memory at:
+
+```text
+http://localhost:8080/api/dj-memory
+```
+
+The implementation roadmap for making Claudio feel more like a real private DJ lives in `docs/DJ_PERSONALIZATION_GOALS.md`.
+
+The active program arc can be inspected at:
+
+```text
+http://localhost:8080/api/program-arc
+```
+
+The arc tracks the current set direction, phase, energy curve, and next move. Correction messages such as `不是这种 Drake` or `not this version` create a correction-recovery arc with negative constraints so Claudio can reset the lane instead of treating the message as ordinary chat.
+
+For the radio runtime, job queues, WebSocket events, latency knobs, and smoke tests, see `docs/RADIO_ENGINE.md`.
 
 Open:
 
@@ -123,6 +175,14 @@ yarn check
 # or
 npm run check
 ```
+
+### Troubleshooting
+
+If the terminal says `LLM unavailable` or shows `503 status code`, the active LLM provider is temporarily failing. Claudio retries the request and then tries `LLM_FALLBACK_PROVIDERS`; configure at least one working fallback if you use Gemini as the primary provider.
+
+If you hear a backup-style opening, it means every configured LLM provider failed or returned no usable tracks. Check the lines immediately above it in the terminal for the provider error and whether the fallback provider was attempted.
+
+If Kokoro logs `fetch failed`, keep the Kokoro sidecar running and let `TTS_SYNTH_RETRIES` retry transient local TTS failures. Reduce `TTS_SYNTH_CONCURRENCY` to `1` if the local machine struggles with parallel synthesis.
 
 ## Current Version
 
@@ -140,7 +200,7 @@ It is designed for one local listener experience: one private station, one local
 
 它会像真正的 DJ 一样，根据你的品味和当下时刻，自动选歌、播报、串场和续播。
 
-Claudio 不是歌单生成器，也不是等你下命令的聊天机器人。你打开它，按下播放，它就开始为你经营一小段电台节目：看现在是什么时间，参考你的音乐品味和最近播放，挑几首合适的歌，再把每一句 DJ 播报转成语音，插入到音乐之间。
+Claudio 不是歌单生成器，也不是等你下命令的聊天机器人。你打开它，按下播放，它就开始为你经营一小段电台节目：看本地时间，参考你的音乐品味和播放历史，挑几首合适的歌，再把每一句 DJ 播报转成语音，插入到音乐之间。
 
 ## 它听起来像什么
 
@@ -161,6 +221,7 @@ Claudio 适合那些你不想自己整理歌单的时刻。
 - 自动补歌，让电台继续播下去。
 - 支持选择 DJ 使用英文或中文播报。
 - 支持分别控制 DJ 音量和音乐音量。
+- 不请求浏览器定位，也不调用天气 API；运行上下文只使用本地时间和 locale。
 
 ## 它特别在哪里
 
@@ -205,7 +266,7 @@ VOLCENGINE_TTS_VOICE_TYPE=en_female_nadia_tips_emo_v2_mars_bigtts
 - 豆包语音 API Key 激活与获取地址：[火山引擎语音技术控制台](https://console.volcengine.com/speech/new/setting/activate?ResourceID=volc.service_type.10029&projectName=default)。
 - 豆包语音目前赠送 1.0 语音模型 20,000 字免费用量，以及 2.0 语音模型 20,000 字免费用量。
 
-### 可选服务
+### 可选服务与稳定性
 
 Spotify 可用于音乐元数据和 Web Playback SDK 播放。需要启用时填写：
 
@@ -218,7 +279,7 @@ SPOTIFY_REDIRECT_URI=http://127.0.0.1:8080/auth/spotify/callback
 
 然后打开 `http://localhost:8080/auth/spotify` 完成一次授权。Spotify 播放需要 Spotify Premium；本地 token 会保存在 `data/spotify/`，该目录已被 Git 忽略。
 
-Kokoro 可作为本地 TTS sidecar：
+Kokoro 可作为本地 TTS sidecar。`yarn start` 会在 `TTS_PROVIDER=kokoro` 时自动启动它；也可以手动运行：
 
 ```bash
 yarn kokoro:start
@@ -228,7 +289,25 @@ npm run kokoro:start
 
 然后在 `.env` 中设置 `TTS_PROVIDER=kokoro` 或 `CALLER_TTS_PROVIDER=kokoro`。
 
-Gemini 可作为兼容 OpenAI SDK 的 LLM provider：设置 `LLM_PROVIDER=gemini` 和 `GEMINI_API_KEY` 即可。
+Gemini 可作为兼容 OpenAI SDK 的 LLM provider：设置 `LLM_PROVIDER=gemini` 和 `GEMINI_API_KEY` 即可。LLM 调用会重试 503 等临时错误，然后尝试 `LLM_FALLBACK_PROVIDERS` 里用逗号分隔的备用 provider。默认备用是 `claude_cli`，需要本机已安装并登录 `claude` 命令。
+
+常用稳定性和延迟参数：
+
+```bash
+LLM_RETRIES=2
+LLM_RETRY_DELAY_MS=1200
+LLM_FALLBACK_PROVIDERS=claude_cli
+MUSIC_RESOLVE_CONCURRENCY=3
+DIRECT_ARTIST_TRACK_COUNT=3
+SPOTIFY_FAST_START=0
+TTS_SYNTH_CONCURRENCY=3
+TTS_SYNTH_RETRIES=2
+```
+
+当 Spotify Web Playback 已连接且希望优先用 Spotify URI 播放时，可以设置 `SPOTIFY_FAST_START=1`；这样 Spotify 命中后会跳过 yt-dlp 音频流 fallback，首播会更快。
+
+歌曲解析和 TTS 合成会用小并发执行，但最终结果顺序和队列去重仍按原始请求曲目顺序处理。
+直接歌手点歌，例如 `Drake` 或 `play Drake songs`，会搜索 Spotify track 结果，并加入最多 `DIRECT_ARTIST_TRACK_COUNT` 首 artist 字段匹配该歌手的曲目。对 `HUMBLE` 这种裸输入，如果没有匹配到同名歌手曲目，就会继续按歌名搜索。
 
 启动 Claudio：
 
@@ -240,6 +319,10 @@ yarn start
 `NETEASE_COOKIE`，也没有已保存的本地 cookie，它会生成网易云二维码登录页：
 `data/netease/qr-login.html`。用网易云音乐 App 扫码后，Claudio 会把 cookie
 保存到 `data/netease/`，后续启动自动复用；该目录会被 Git 忽略。
+
+应用还会把浏览器 time zone 和 locale 同步到 `/api/environment`。该接口只返回时间上下文，不保存坐标、浏览器定位或天气。
+
+电台运行状态机、任务队列、WebSocket 事件、延迟参数和 smoke test 记录在 `docs/RADIO_ENGINE.md`。
 
 打开：
 
@@ -254,6 +337,14 @@ yarn check
 # 或
 npm run check
 ```
+
+### 故障排查
+
+如果终端出现 `LLM unavailable` 或 `503 status code`，说明当前 LLM provider 临时不可用。Claudio 会先重试，再尝试 `LLM_FALLBACK_PROVIDERS`；如果主 provider 使用 Gemini，建议至少配置一个可用备用 provider。
+
+如果听到备用开场，说明所有已配置 LLM provider 都失败，或没有返回可用曲目。看它前面的终端日志，可以确认具体 provider 错误以及是否已尝试 fallback。
+
+如果 Kokoro 出现 `fetch failed`，保持 Kokoro sidecar 运行，让 `TTS_SYNTH_RETRIES` 处理短暂失败。如果本机并行合成压力过大，把 `TTS_SYNTH_CONCURRENCY` 调低到 `1`。
 
 ## 当前版本
 

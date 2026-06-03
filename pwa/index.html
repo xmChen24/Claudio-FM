@@ -389,7 +389,6 @@ html, body {
   text-transform: uppercase;
   max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.header-weather { display: none; }
 .wave-wrap {
   position: absolute; left: 0; right: 0; bottom: 0; height: 76px;
   z-index: 1; pointer-events: none;
@@ -982,7 +981,6 @@ html, body {
         <div class="header-time" id="headerTime">—:—</div>
         <div class="header-date" id="headerDate">Updating day</div>
         <div class="header-calendar" id="headerCalendar">Updating date</div>
-        <div class="header-weather" id="headerWeather">Weather pending</div>
       </div>
       <div class="wave-wrap">
         <canvas id="waveCanvas" width="1232" height="340"></canvas>
@@ -1139,7 +1137,6 @@ const headerStatus = document.getElementById('headerStatus');
 const headerTime   = document.getElementById('headerTime');
 const headerDate   = document.getElementById('headerDate');
 const headerCalendar = document.getElementById('headerCalendar');
-const headerWeather = document.getElementById('headerWeather');
 const metaName   = document.getElementById('metaName');
 const nowPlayingTitle = document.getElementById('nowPlayingTitle');
 const metaSub    = document.getElementById('metaSub');
@@ -1178,8 +1175,6 @@ const REFILL_BACKOFF_MS = 45000;
 const SPOTIFY_END_GRACE_MS = 2500;
 let environmentSnapshot = null;
 let environmentSyncInFlight = null;
-let locationRequestStarted = false;
-let locationUnavailable = false;
 
 /* ── Random starfield ─────────────────────────────────────────────── */
 function seededRandom(seed) {
@@ -1241,19 +1236,11 @@ function renderStarfield() {
 renderStarfield();
 window.addEventListener('resize', renderStarfield);
 
-function localEnvironmentPayload(extra = {}) {
+function localEnvironmentPayload() {
   return {
     timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     locale: navigator.language || 'en-US',
-    ...extra,
   };
-}
-
-function weatherDisplayText(snapshot = environmentSnapshot) {
-  if (snapshot?.weatherText) return snapshot.weatherText;
-  if (locationUnavailable) return 'Weather needs location';
-  if (snapshot?.weatherError) return 'Weather unavailable';
-  return 'Weather pending';
 }
 
 function updateEnvironmentUi(snapshot = environmentSnapshot) {
@@ -1274,14 +1261,10 @@ function updateEnvironmentUi(snapshot = environmentSnapshot) {
   const day = now.toLocaleDateString(locale, { timeZone, day: '2-digit' });
   const year = now.toLocaleDateString(locale, { timeZone, year: 'numeric' });
   headerCalendar.textContent = `${day} ${month} ${year}`;
-  headerWeather.textContent = weatherDisplayText(snapshot);
-  headerWeather.title = snapshot?.locationLabel
-    ? `${snapshot.locationLabel} · ${weatherDisplayText(snapshot)}`
-    : weatherDisplayText(snapshot);
 }
 
-async function syncEnvironment(extra = {}) {
-  const payload = localEnvironmentPayload(extra);
+async function syncEnvironment() {
+  const payload = localEnvironmentPayload();
   environmentSyncInFlight = fetch('/api/environment', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1302,35 +1285,13 @@ async function syncEnvironment(extra = {}) {
   return environmentSyncInFlight;
 }
 
-function requestEnvironmentLocation() {
-  if (locationRequestStarted || !navigator.geolocation) return Promise.resolve(environmentSnapshot);
-  locationRequestStarted = true;
-  return new Promise(resolve => {
-    navigator.geolocation.getCurrentPosition(
-      position => {
-        syncEnvironment({
-          latitude: position.coords.latitude,
-          longitude: position.coords.longitude,
-        }).then(resolve);
-      },
-      () => {
-        locationUnavailable = true;
-        headerWeather.textContent = environmentSnapshot?.weatherText || 'Weather needs location';
-        resolve(environmentSnapshot);
-      },
-      { enableHighAccuracy: false, timeout: 7000, maximumAge: 30 * 60 * 1000 }
-    );
-  });
-}
-
 function buildStartMessage() {
   const now = new Date();
   const timeZone = environmentSnapshot?.timeZone || Intl.DateTimeFormat().resolvedOptions().timeZone;
   const locale = environmentSnapshot?.locale || navigator.language || 'en-US';
   const time = now.toLocaleTimeString(locale, { timeZone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
   const date = now.toLocaleDateString(locale, { timeZone, weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
-  const weather = environmentSnapshot?.weatherText ? ` Weather right now: ${environmentSnapshot.weatherText}.` : '';
-  return `It's ${time} on ${date} (${timeZone}).${weather} You're on air — open the station. Pick whatever fits the moment.`;
+  return `It's ${time} on ${date} (${timeZone}). You're on air — open the station. Pick whatever fits the moment.`;
 }
 let startingRadio = false;
 let retuningStation = false;
@@ -1420,7 +1381,7 @@ function setStationNotice(message = '', link = null) {
 
 /* ── Clock ────────────────────────────────────────────────────────── */
 updateEnvironmentUi();
-syncEnvironment().then(() => requestEnvironmentLocation());
+syncEnvironment();
 setInterval(() => updateEnvironmentUi(), 10000);
 setInterval(() => syncEnvironment(), 10 * 60 * 1000);
 
@@ -1650,6 +1611,24 @@ function scheduleSpotifyEnd() {
   spotifyProgressTimer = setInterval(updateSpotifyProgressUi, 1000);
 }
 
+function waitForSpotifyReady(timeoutMs = 4500) {
+  if (spotifyReady && spotifyDeviceId) return Promise.resolve(true);
+  return new Promise(resolve => {
+    const startedAt = Date.now();
+    const timer = setInterval(() => {
+      if (spotifyReady && spotifyDeviceId) {
+        clearInterval(timer);
+        resolve(true);
+        return;
+      }
+      if (Date.now() - startedAt >= timeoutMs) {
+        clearInterval(timer);
+        resolve(false);
+      }
+    }, 120);
+  });
+}
+
 async function fetchSpotifyToken() {
   const res = await fetch('/api/spotify/token');
   if (res.status === 401) {
@@ -1871,6 +1850,7 @@ function afterTtsFinished() {
   } else {
     setRadioStatus('Paused');
   }
+  flushImmediateSegments();
 }
 ttsAudio.addEventListener('play',  () => { setRadioStatus('Speaking'); duckMusic(); });
 ttsAudio.addEventListener('pause', () => { if (!ttsAudio.ended) restoreMusicVolume(); });
@@ -2131,6 +2111,11 @@ let outroTalkPromise = null;
 let outroTalkToken = 0;
 let scriptSegments = [];
 let handledSegmentIds = new Set();
+let pendingImmediateSegments = [];
+let queuedSegmentIds = new Set();
+let requestLineActive = false;
+let voiceObjectActive = false;
+let voiceSequenceActive = false;
 let programClockStartedAt = null;
 let currentProgramId = null;
 let lastRefillAt = 0;
@@ -2150,12 +2135,25 @@ function segmentKey(segment) {
 
 function markSegmentHandled(segment) {
   const key = segmentKey(segment);
-  if (key) handledSegmentIds.add(key);
+  if (key) {
+    handledSegmentIds.add(key);
+    queuedSegmentIds.delete(key);
+  }
 }
 
 function wasSegmentHandled(segment) {
   const key = segmentKey(segment);
   return key && handledSegmentIds.has(key);
+}
+
+function isSegmentQueued(segment) {
+  const key = segmentKey(segment);
+  return key && queuedSegmentIds.has(key);
+}
+
+function markSegmentQueued(segment) {
+  const key = segmentKey(segment);
+  if (key) queuedSegmentIds.add(key);
 }
 
 function findSegment(matchFn) {
@@ -2173,10 +2171,12 @@ function speakSegmentObject(segment, onEnd) {
     const finish = () => {
       if (settled) return;
       settled = true;
+      voiceObjectActive = false;
       ttsAudio.removeEventListener('ended', finish);
       ttsAudio.removeEventListener('error', finish);
       if (onEnd) onEnd();
       resolve();
+      if (!voiceSequenceActive) flushImmediateSegments();
     };
 
     if (!segment) { finish(); return; }
@@ -2194,6 +2194,7 @@ function speakSegmentObject(segment, onEnd) {
     }
     lastTtsUrl = segment.ttsUrl;
     lastReplaySegment = segment;
+    voiceObjectActive = true;
     ttsAudio.src = segment.ttsUrl;
     ttsAudio.addEventListener('ended', finish, { once: true });
     ttsAudio.addEventListener('error', finish, { once: true });
@@ -2208,14 +2209,18 @@ function speakSegmentObject(segment, onEnd) {
 function speakSegmentSequence(segments, onEnd) {
   return new Promise(resolve => {
     const pending = segments.filter(segment => segment && !wasSegmentHandled(segment));
+    const previousSequenceActive = voiceSequenceActive;
     let settled = false;
     const finish = () => {
       if (settled) return;
       settled = true;
+      voiceSequenceActive = previousSequenceActive;
       if (onEnd) onEnd();
       resolve();
+      if (!voiceSequenceActive) flushImmediateSegments();
     };
 
+    if (pending.length) voiceSequenceActive = true;
     if (pending.some(segment => segment.resetClockOnSpeak)) resetProgramClock();
     function playOne() {
       const segment = pending.shift();
@@ -2227,6 +2232,60 @@ function speakSegmentSequence(segments, onEnd) {
     }
     playOne();
   });
+}
+
+function voiceChannelBusy() {
+  return requestLineActive || voiceObjectActive || voiceSequenceActive || (!ttsAudio.paused && !ttsAudio.ended);
+}
+
+function resetProgramPlaybackState() {
+  outroTalkToken++;
+  outroTalkPromise = null;
+  queue = [];
+  queueIdx = 0;
+  scriptSegments = [];
+  handledSegmentIds.clear();
+  pendingImmediateSegments = [];
+  queuedSegmentIds.clear();
+  autoRefilling = false;
+  segueStarted = false;
+  awaitingNextTrack = false;
+  voiceObjectActive = false;
+  voiceSequenceActive = false;
+  requestLineActive = false;
+
+  try {
+    ttsAudio.dispatchEvent(new Event('error'));
+    ttsAudio.pause();
+    ttsAudio.removeAttribute('src');
+    ttsAudio.load();
+  } catch {}
+
+  if (spotifyActive && spotifyPlayer) spotifyPlayer.pause().catch(console.error);
+  spotifyActive = false;
+  spotifyPaused = true;
+  clearSpotifyTimers();
+
+  musicAudio.pause();
+  musicAudio.removeAttribute('src');
+  musicAudio.load();
+  renderQueue();
+}
+
+function queueImmediateSegments(segments) {
+  const pending = (segments || []).filter(segment =>
+    segment && !wasSegmentHandled(segment) && !isSegmentQueued(segment)
+  );
+  if (!pending.length) return;
+  pending.forEach(markSegmentQueued);
+  pendingImmediateSegments = [...pendingImmediateSegments, ...pending];
+  flushImmediateSegments();
+}
+
+function flushImmediateSegments() {
+  if (voiceChannelBusy() || !pendingImmediateSegments.length) return;
+  const pending = pendingImmediateSegments.splice(0);
+  speakSegmentSequence(pending, flushImmediateSegments);
 }
 
 function speakSegment(transcript, ttsUrl, onEnd) {
@@ -2441,11 +2500,20 @@ function autoRefill() {
       hostMode,
     }),
   })
+    .then(async res => {
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || `Refill failed: ${res.status}`);
+      if (body.queued === false) {
+        lastRefillAt = Date.now();
+        autoRefilling = false;
+      }
+      return body;
+    })
     .catch(err => {
       console.error(err);
       lastRefillAt = Date.now();
-    })
-    .finally(() => { autoRefilling = false; });
+      autoRefilling = false;
+    });
 }
 
 async function playTrack(track) {
@@ -2461,6 +2529,10 @@ async function playTrack(track) {
   } else {
     metaSourceText.textContent = '';
     metaSource.style.display = 'none';
+  }
+  if (track.spotifyUri && !track.streamUrl && (!spotifyReady || !spotifyDeviceId)) {
+    setStationNotice('Connecting Spotify playback…');
+    await waitForSpotifyReady();
   }
   if (track.spotifyUri && spotifyReady && spotifyDeviceId) {
     try {
@@ -2621,14 +2693,33 @@ function connectWS() {
   };
 }
 
+function userFacingSystemMessage(message = '') {
+  if (/tts not started|kokoro unreachable|voice engine|tts.*unreachable/i.test(message)) {
+    return 'Voice engine is offline. Claudio can keep the music moving while voice warms up.';
+  }
+  if (/fallback|backup/i.test(message)) {
+    return 'Main signal is slow, so Claudio is opening a backup set.';
+  }
+  return message;
+}
+
 function handleWsMessage(msg) {
   if (msg.type === 'system-log') {
-    addSystemLine(msg.message || 'system event');
+    const displayMessage = msg.details?.userMessage || userFacingSystemMessage(msg.message || 'system event');
+    addSystemLine(displayMessage);
+    if (/voice engine/i.test(displayMessage)) {
+      setStationNotice(displayMessage);
+    }
     if (/fallback|backup/i.test(msg.message || '')) setSignalState('backup');
     return;
   }
 
   if (msg.type === 'program-start') {
+    if (msg.programId && currentProgramId && msg.programId !== currentProgramId) {
+      resetProgramPlaybackState();
+    }
+    startingRadio = false;
+    playBtn.disabled = false;
     currentProgramId = msg.programId || currentProgramId;
     if (msg.sessionTitle) sessionTitleEl.textContent = msg.sessionTitle;
     setSignalState(msg.signal === 'backup' ? 'backup' : 'live');
@@ -2645,7 +2736,8 @@ function handleWsMessage(msg) {
       segment.position === 'immediate' ||
       (segment.position === 'before_track' && (segment.trackIndex ?? 0) === queueIdx)
     );
-    if (immediateSegments.length) speakSegmentSequence(immediateSegments);
+    if (immediateSegments.length) queueImmediateSegments(immediateSegments);
+    if (msg.openingPending) addSystemLine('Music is live. Claudio is writing the opening link…');
     return;
   }
 
@@ -2661,6 +2753,14 @@ function handleWsMessage(msg) {
     currentProgramId = msg.programId || currentProgramId;
     const incomingSegments = normalizeIncomingSegments(msg);
     scriptSegments = [...scriptSegments, ...incomingSegments];
+    const immediateSegments = findSegments(segment =>
+      segment.position === 'immediate' ||
+      (segment.position === 'before_track' && (segment.trackIndex ?? 0) === queueIdx)
+    );
+    if (immediateSegments.length) {
+      queueImmediateSegments(immediateSegments);
+      return;
+    }
     maybeStartOutroTalk();
     return;
   }
@@ -2675,9 +2775,28 @@ function handleWsMessage(msg) {
       }
     }
     if (msg.jobType === 'program_start') {
+      startingRadio = false;
+      playBtn.disabled = false;
       setRadioStatus('Paused');
       metaSub.textContent = '';
       addSystemLine('Could not start Claudio FM');
+    }
+    return;
+  }
+
+  if (msg.type === 'job-status' && ['program_start', 'opening_generation'].includes(msg.jobType)) {
+    const phaseText = {
+      choose_tracks: 'Choosing the first set…',
+      resolve_audio: 'Finding playable audio…',
+      write_open: 'Writing the opening link…',
+      voice_open: 'Opening the signal…',
+    };
+    if (msg.status === 'started') {
+      setRadioStatus('On Air');
+      addSystemLine(msg.jobType === 'opening_generation' ? 'Preparing Claudio’s opening…' : 'Starting Claudio FM…');
+    } else if (msg.status === 'phase' && phaseText[msg.phase]) {
+      setRadioStatus('On Air');
+      addSystemLine(phaseText[msg.phase]);
     }
     return;
   }
@@ -2725,7 +2844,7 @@ function handleWsMessage(msg) {
         segment.position === 'immediate' ||
         (segment.position === 'before_track' && (segment.trackIndex ?? 0) === queueIdx)
       );
-      if (immediateSegments.length) speakSegmentSequence(immediateSegments);
+      if (immediateSegments.length) queueImmediateSegments(immediateSegments);
       else if (msg.status === 'speaking') setRadioStatus('Speaking');
     }
   }
@@ -2757,6 +2876,7 @@ async function requestChat(message, { showUserTurn = true } = {}) {
     body: JSON.stringify({ message, djLanguage, hostMode }),
   });
   if (!res.ok) throw new Error(await res.text());
+  return res.json().catch(() => ({}));
 }
 
 async function requestVibeShift(kind) {
@@ -2784,25 +2904,34 @@ async function requestVibeShift(kind) {
 
 async function patchCallerIntoStation(text) {
   addCallerTurn(text);
-  let callerAudio = null;
-  try {
-    callerAudio = await requestCallerTts(text);
-  } catch (err) {
+  requestLineActive = true;
+  const callerAudioPromise = requestCallerTts(text).catch(err => {
     console.error('[caller-tts]', err);
-  }
+    return null;
+  });
+  const djPromise = requestChat(text, { showUserTurn: false }).catch(err => {
+    console.error('[request-line-chat]', err);
+    addSystemLine('Could not reach Claudio on the request line');
+  });
 
-  await playRequestLineConnect();
-  if (callerAudio?.ttsUrl) {
-    await playCallerVoice(callerAudio.ttsUrl);
-  } else {
-    restoreMusicVolume();
-    afterTtsFinished();
+  try {
+    await playRequestLineConnect();
+    const callerAudio = await callerAudioPromise;
+    if (callerAudio?.ttsUrl) {
+      await playCallerVoice(callerAudio.ttsUrl);
+    } else {
+      restoreMusicVolume();
+      afterTtsFinished();
+    }
+    await djPromise;
+  } finally {
+    requestLineActive = false;
+    flushImmediateSegments();
   }
-  await requestChat(text, { showUserTurn: false });
 }
 
 async function startRadio() {
-  if (startingRadio || musicAudio.src) return;
+  if (startingRadio || currentProgramId || queue.length || musicIsPlaying()) return;
   startingRadio = true;
   playBtn.disabled = true;
   setRadioStatus('On Air');
@@ -2810,14 +2939,16 @@ async function startRadio() {
   addSystemLine('Tuning Claudio FM…');
   try {
     await (environmentSyncInFlight || syncEnvironment());
-    await requestEnvironmentLocation();
-    await requestChat(buildStartMessage(), { showUserTurn: false });
+    const result = await requestChat(buildStartMessage(), { showUserTurn: false });
+    if (!result?.queued) {
+      playBtn.disabled = false;
+      startingRadio = false;
+    }
   } catch (err) {
     console.error('[start-radio]', err);
     setRadioStatus('Paused');
     metaSub.textContent = '';
     addSystemLine('Could not start Claudio FM');
-  } finally {
     playBtn.disabled = false;
     startingRadio = false;
   }

@@ -24,7 +24,7 @@ When a song deserves a real cold open, this shape works well:
 
 1. **Anchor** — a concrete fact: the year, who wrote it, an instrument, a detail.
 2. **Heart** — the human story behind it.
-3. **Turn** — connect it to *this* moment: the hour, the weather, where the listener might be sitting.
+3. **Turn** — connect it to *this* moment: the hour, the pace of the day, the room the music creates.
 4. **Image** — a line that puts them somewhere. "You're standing at a farewell..."
 5. **Invitation** — a short send-off. "Let it keep you company for a while."
 

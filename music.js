@@ -48,4 +48,19 @@ async function getTrack(query) {
   return null;
 }
 
-module.exports = { getStreamUrl, getTrack, searchUrl: ytDlp.searchUrl };
+async function getArtistTracks(query, count = 3, options = {}) {
+  const provider = process.env.MUSIC_PROVIDER || 'auto';
+  console.log(`[音乐] 搜索歌手: "${query}" (来源: ${provider})`);
+
+  if (provider === 'spotify' || (provider === 'auto' && process.env.SPOTIFY_CLIENT_ID && process.env.SPOTIFY_CLIENT_SECRET)) {
+    const tracks = await spotify.getArtistTracks(query, count, options);
+    if (tracks.length) {
+      console.log(`[音乐] Spotify 歌手找到: ${query} → ${tracks.map(track => track.title).join(', ')}`);
+      return tracks;
+    }
+  }
+
+  return [];
+}
+
+module.exports = { getStreamUrl, getTrack, getArtistTracks, searchUrl: ytDlp.searchUrl };

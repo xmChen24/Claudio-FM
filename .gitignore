@@ -3,7 +3,6 @@ node_modules/
 cache/tts/*.mp3
 cache/tts/*.wav
 kororo-voice/
-docs/
 *.sqlite
 *.db
 Kokoro-FastAPI/
@@ -27,3 +26,4 @@ skills/netease-music/data/*
 # Claudio local Netease login state. May contain cookies and private QR pages.
 data/netease/*
 data/spotify/*
+user/dj-memory.json

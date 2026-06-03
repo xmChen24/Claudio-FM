@@ -10,9 +10,12 @@ const { route } = require('./router');
 const { buildPrompt, buildProgramStartPrompt, buildColdOpenForTracksPrompt, buildMusicRefillPrompt, buildBridgePrompt } = require('./context');
 const { callClaude } = require('./claude');
 const { synthesize } = require('./tts');
-const { getTrack } = require('./music');
+const { getTrack, getArtistTracks } = require('./music');
 const { addPlay, addMessage, recentPlays, getPref } = require('./state');
 const { environmentSnapshot, updateEnvironment } = require('./env-context');
+const { captureUserSignal, loadDjMemory } = require('./dj-memory');
+const { createProgramArc, extendProgramArc } = require('./program-arc');
+const { buildCorrectionContext } = require('./dj-correction');
 const scheduler = require('./scheduler');
 
 const PORT = Number(process.env.PORT || 8080);
@@ -128,6 +131,37 @@ function kokoroBaseUrl() {
   return (process.env.KOKORO_API_BASE || 'http://127.0.0.1:8880').replace(/\/+$/, '');
 }
 
+function userFacingSystemMessage(message = '') {
+  if (/tts not started|kokoro unreachable|voice engine|tts.*unreachable/i.test(message)) {
+    return 'Voice engine is offline. Claudio can keep the music moving while voice warms up.';
+  }
+  if (/fallback|backup/i.test(message)) {
+    return 'Main signal is slow, so Claudio is opening a backup set.';
+  }
+  return message;
+}
+
+function broadcastUserSystemLog(level, message, details = {}) {
+  broadcastSystemLog(level, message, {
+    ...details,
+    userMessage: details.userMessage || userFacingSystemMessage(message),
+  });
+}
+
+function metricTimer(label) {
+  const startedAt = Date.now();
+  const marks = {};
+  return {
+    mark(name) {
+      marks[name] = Date.now() - startedAt;
+      console.log(`[metric:${label}] ${name}=${marks[name]}ms`);
+    },
+    snapshot(extra = {}) {
+      return { label, totalMs: Date.now() - startedAt, ...marks, ...extra };
+    },
+  };
+}
+
 async function sendTtsUnavailableIfNeeded(ws) {
   if ((process.env.TTS_PROVIDER || 'volcengine') !== 'kokoro') return;
 
@@ -140,6 +174,7 @@ async function sendTtsUnavailableIfNeeded(ws) {
   } catch (err) {
     sendSystemLog(ws, 'error', `tts not started: Kokoro unreachable at ${baseUrl}`, {
       error: err.name === 'AbortError' ? 'health check timed out' : err.message,
+      userMessage: userFacingSystemMessage('tts not started'),
     });
   } finally {
     clearTimeout(timer);
@@ -155,6 +190,10 @@ const REFILL_TRACK_COUNT = 3;
 const PROGRAM_START_ID_TEXT = 'This is Claudio.';
 const TRACK_REPEAT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const ARTIST_RECENT_WINDOW = 5;
+const MUSIC_RESOLVE_CONCURRENCY = Math.max(1, Number(process.env.MUSIC_RESOLVE_CONCURRENCY || 3));
+const TTS_SYNTH_CONCURRENCY = Math.max(1, Number(process.env.TTS_SYNTH_CONCURRENCY || 3));
+const TTS_SYNTH_RETRIES = Math.max(0, Number(process.env.TTS_SYNTH_RETRIES || 2));
+const DIRECT_ARTIST_TRACK_COUNT = Math.max(1, Number(process.env.DIRECT_ARTIST_TRACK_COUNT || 3));
 const FALLBACK_PROGRAM_TRACKS = [
   'Sweet Disposition - The Temper Trap',
   'Ventura Highway - America',
@@ -177,9 +216,14 @@ const stationState = {
   programId: null,
   sessionTitle: '',
   tracks: [],
-  generationJobs: [],
+  programArc: null,
+  lastMusicIntent: null,
+  lastCorrectionContext: null,
+  foregroundJobs: [],
+  backgroundJobs: [],
   jobKeys: new Set(),
-  workerRunning: false,
+  foregroundWorkerRunning: false,
+  backgroundWorkerRunning: false,
 };
 
 function normalizeDjLanguage(value) {
@@ -324,7 +368,7 @@ function fallbackProgramStartResult(job = {}, reason = '') {
         part: 'anchor',
         position: 'before_track',
         trackIndex: 0,
-        text: '主线路刚才有点拥堵，Claudio 先切到一组稳定的夜间备用歌单。',
+        text: 'Claudio 先从一组稳定的夜间歌单开始，把信号慢慢打开。',
       },
       {
         type: 'cold_open',
@@ -341,7 +385,7 @@ function fallbackProgramStartResult(job = {}, reason = '') {
         part: 'anchor',
         position: 'before_track',
         trackIndex: 0,
-        text: 'The main signal is congested, so Claudio is switching to a stable night backup set.',
+        text: 'Claudio is opening with a steady night set while the signal settles in.',
       },
       {
         type: 'cold_open',
@@ -488,14 +532,14 @@ function normalizeSegments(result, tracks, speechOnly, failedTracks) {
 }
 
 async function synthesizeSegments(segments) {
-  for (const segment of segments) {
+  async function synthesizeOne(segment) {
     if (segment.type === 'silence' || !segment.text) {
       segment.status = 'silent';
-      continue;
+      return;
     }
     try {
       console.log(`[TTS] 合成 ${segment.type} (${segment.text.length} 字): "${segment.text.slice(0, 50)}…"`);
-      const f = await synthesize(segment.text);
+      const f = await synthesizeWithRetry(segment.text);
       segment.ttsUrl = '/api/tts/' + path.basename(f);
       segment.status = 'ready';
       console.log(`[TTS] ${segment.type} 完成 → ${path.basename(f)}`);
@@ -505,13 +549,36 @@ async function synthesizeSegments(segments) {
       console.error(`[TTS] ${segment.type} 合成失败:`, err.message);
       const provider = process.env.TTS_PROVIDER || 'volcengine';
       if (provider === 'kokoro' && /fetch failed|ECONNREFUSED|failed/i.test(err.message)) {
-        broadcastSystemLog('error', `tts not started: Kokoro unreachable at ${kokoroBaseUrl()}`, {
+        broadcastUserSystemLog('error', `tts not started: Kokoro unreachable at ${kokoroBaseUrl()}`, {
           error: err.message,
         });
       }
     }
   }
+
+  await mapWithConcurrency(segments, TTS_SYNTH_CONCURRENCY, synthesizeOne);
   return segments;
+}
+
+async function synthesizeWithRetry(text, options = {}) {
+  let lastError;
+  for (let attempt = 0; attempt <= TTS_SYNTH_RETRIES; attempt++) {
+    try {
+      return await synthesize(text, options);
+    } catch (err) {
+      lastError = err;
+      if (attempt >= TTS_SYNTH_RETRIES || !isRetryableAudioError(err)) break;
+      const delayMs = 600 * (attempt + 1);
+      console.warn(`[TTS] retry ${attempt + 1}/${TTS_SYNTH_RETRIES} after ${err.message}`);
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+  }
+  throw lastError;
+}
+
+function isRetryableAudioError(err) {
+  const message = String(err?.message || '');
+  return /fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|timeout|\b(429|500|502|503|504)\b/i.test(message);
 }
 
 function applyLegacyTrackIntrosFromSegments(tracks, segments) {
@@ -601,6 +668,21 @@ function trackMatchesRequest(requested, resolved) {
   return titleMatches && artistMatches;
 }
 
+function payloadTrackFromResolved(query, requested, track) {
+  return {
+    query,
+    title: track.title || requested.title || query,
+    artist: track.artist || requested.artist || '',
+    streamUrl: track.streamUrl || '',
+    source: track.source || '',
+    spotifyUri: track.spotifyUri || '',
+    spotifyUrl: track.spotifyUrl || '',
+    imageUrl: track.imageUrl || '',
+    album: track.album || '',
+    durationMs: track.durationMs || 0,
+  };
+}
+
 function shouldSkipTrack(track, avoidState) {
   const identity = trackIdentity(track);
   const urlIdentity = trackUrlIdentity(track);
@@ -656,9 +738,18 @@ async function resolveRequestedTracks(requestedTracks, options = {}) {
   const failedTracks = [];
   const avoidState = createTrackAvoidState(options.queue || []);
   const enforceAvoidance = options.enforceAvoidance !== false;
-  for (let i = 0; i < requestedTracks.length; i++) {
-    const query = requestedTracks[i];
-    const track = await getTrack(query);
+
+  const resolved = await mapWithConcurrency(requestedTracks, MUSIC_RESOLVE_CONCURRENCY, async (query, i) => {
+    try {
+      return { i, query, track: await getTrack(query) };
+    } catch (err) {
+      console.warn(`[音乐] ✗ ${i + 1}/${requestedTracks.length} 解析失败: ${query} | ${err.message}`);
+      return { i, query, track: null };
+    }
+  });
+
+  for (const item of resolved) {
+    const { i, query, track } = item;
     if (track?.streamUrl || track?.spotifyUri) {
       const requested = parseRequestedTrack(query);
       if (!trackMatchesRequest(requested, track)) {
@@ -666,18 +757,7 @@ async function resolveRequestedTracks(requestedTracks, options = {}) {
         console.log(`[音乐] ↷ ${i + 1}/${requestedTracks.length} 跳过错配: 请求 "${query}"，返回 "${track.title}${track.artist ? ' — ' + track.artist : ''}"`);
         continue;
       }
-      const payloadTrack = {
-        query,
-        title: track.title || requested.title || query,
-        artist: track.artist || requested.artist || '',
-        streamUrl: track.streamUrl || '',
-        source: track.source || '',
-        spotifyUri: track.spotifyUri || '',
-        spotifyUrl: track.spotifyUrl || '',
-        imageUrl: track.imageUrl || '',
-        album: track.album || '',
-        durationMs: track.durationMs || 0,
-      };
+      const payloadTrack = payloadTrackFromResolved(query, requested, track);
       if (enforceAvoidance) {
         const skip = shouldSkipTrack(payloadTrack, avoidState);
         if (skip.skip) {
@@ -700,6 +780,72 @@ async function resolveRequestedTracks(requestedTracks, options = {}) {
   return { tracks, failedTracks };
 }
 
+async function resolveDirectMusicRequest(request = {}) {
+  const failedTracks = [];
+  const rawQuery = String(request.query || request.title || request.artist || '').trim();
+  if (!rawQuery) return { tracks: [], failedTracks: ['empty direct request'], requestType: 'unknown' };
+
+  if (request.kind === 'artist') {
+    const tracks = await resolveArtistRequest(request.artist || rawQuery);
+    if (tracks.length) return { tracks, failedTracks, requestType: 'artist' };
+    failedTracks.push(`${rawQuery} (artist not found)`);
+    return { tracks: [], failedTracks, requestType: 'artist' };
+  }
+
+  if (request.kind === 'unknown') {
+    const artistTracks = await resolveArtistRequest(rawQuery);
+    if (artistTracks.length) return { tracks: artistTracks, failedTracks, requestType: 'artist' };
+  }
+
+  const trackQuery = request.kind === 'track' && request.title && request.artist
+    ? `${request.title} - ${request.artist}`
+    : rawQuery;
+  const track = await getTrack(trackQuery);
+  if (!track?.streamUrl && !track?.spotifyUri) {
+    failedTracks.push(`${trackQuery} (track not found)`);
+    return { tracks: [], failedTracks, requestType: 'track' };
+  }
+
+  const requested = parseRequestedTrack(trackQuery);
+  const payloadTrack = payloadTrackFromResolved(trackQuery, requested, track);
+  addPlay({ title: payloadTrack.title, artist: payloadTrack.artist, source_url: payloadTrack.streamUrl || payloadTrack.spotifyUri });
+  console.log(`[点歌] ✓ 找到曲目: ${payloadTrack.title}${payloadTrack.artist ? ' — ' + payloadTrack.artist : ''}`);
+  return { tracks: [payloadTrack], failedTracks, requestType: 'track' };
+}
+
+async function resolveArtistRequest(artist, options = {}) {
+  const artistName = String(artist || '').trim();
+  if (!artistName) return [];
+  const resolved = await getArtistTracks(artistName, DIRECT_ARTIST_TRACK_COUNT, options);
+  const tracks = resolved
+    .filter(track => track?.streamUrl || track?.spotifyUri)
+    .map(track => payloadTrackFromResolved(
+      track.query || `${track.title || artistName} - ${artistName}`,
+      { title: track.title || '', artist: artistName },
+      track
+    ));
+  for (const track of tracks) {
+    addPlay({ title: track.title, artist: track.artist, source_url: track.streamUrl || track.spotifyUri });
+  }
+  if (tracks.length) {
+    console.log(`[点歌] ✓ 找到歌手 ${artistName}: ${tracks.map(track => `${track.title}${track.artist ? ' — ' + track.artist : ''}`).join(' / ')}`);
+  }
+  return tracks;
+}
+
+async function mapWithConcurrency(items, concurrency, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(1, concurrency), items.length || 1);
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
+      results[index] = await mapper(items[index], index);
+    }
+  }));
+  return results;
+}
+
 function enqueueJob(job) {
   const key = job.key || `${job.type}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
   if (stationState.jobKeys.has(key)) {
@@ -707,19 +853,27 @@ function enqueueJob(job) {
     return false;
   }
   stationState.jobKeys.add(key);
-  stationState.generationJobs.push({ ...job, key });
-  console.log(`[jobs] 入队 ${key}`);
-  drainJobs();
+  const queuedJob = { ...job, key };
+  const backgroundJob = ['bridge_generation', 'opening_generation'].includes(job.type);
+  const queue = backgroundJob
+    ? stationState.backgroundJobs
+    : stationState.foregroundJobs;
+  if (job.priority === 'high') queue.unshift(queuedJob);
+  else queue.push(queuedJob);
+  console.log(`[jobs] 入队 ${key}${backgroundJob ? ' (background)' : ''}`);
+  if (backgroundJob) drainBackgroundJobs();
+  else drainForegroundJobs();
   return true;
 }
 
-async function drainJobs() {
-  if (stationState.workerRunning) return;
-  stationState.workerRunning = true;
-  while (stationState.generationJobs.length) {
-    const job = stationState.generationJobs.shift();
+async function drainForegroundJobs() {
+  if (stationState.foregroundWorkerRunning) return;
+  stationState.foregroundWorkerRunning = true;
+  while (stationState.foregroundJobs.length) {
+    const job = stationState.foregroundJobs.shift();
     try {
       console.log(`[jobs] 开始 ${job.key}`);
+      broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'started' });
       await runJob(job);
       console.log(`[jobs] 完成 ${job.key}`);
     } catch (err) {
@@ -729,11 +883,32 @@ async function drainJobs() {
       stationState.jobKeys.delete(job.key);
     }
   }
-  stationState.workerRunning = false;
+  stationState.foregroundWorkerRunning = false;
+}
+
+async function drainBackgroundJobs() {
+  if (stationState.backgroundWorkerRunning) return;
+  stationState.backgroundWorkerRunning = true;
+  while (stationState.backgroundJobs.length) {
+    const job = stationState.backgroundJobs.shift();
+    try {
+      console.log(`[jobs:bg] 开始 ${job.key}`);
+      broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'started' });
+      await runJob(job);
+      console.log(`[jobs:bg] 完成 ${job.key}`);
+    } catch (err) {
+      console.error(`[jobs:bg] 失败 ${job.key}:`, err.message);
+      broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'failed', error: err.message });
+    } finally {
+      stationState.jobKeys.delete(job.key);
+    }
+  }
+  stationState.backgroundWorkerRunning = false;
 }
 
 async function runJob(job) {
   if (job.type === 'program_start') return runProgramStartJob(job);
+  if (job.type === 'opening_generation') return runOpeningGenerationJob(job);
   if (job.type === 'music_refill') return runMusicRefillJob(job);
   if (job.type === 'bridge_generation') return runBridgeGenerationJob(job);
   throw new Error(`Unknown job type: ${job.type}`);
@@ -750,6 +925,7 @@ function enqueueBridgeJobs({ programId, sessionTitle, tracks, startIndex = 0, pr
       beforeTrack: tracks[0],
       afterTrackIndex: previousIndex,
       beforeTrackIndex: startIndex,
+      programArc: stationState.programArc,
       djLanguage: normalizeDjLanguage(djLanguage),
       hostMode: normalizeHostMode(hostMode),
     });
@@ -764,6 +940,7 @@ function enqueueBridgeJobs({ programId, sessionTitle, tracks, startIndex = 0, pr
       beforeTrack: tracks[i],
       afterTrackIndex: startIndex + i - 1,
       beforeTrackIndex: startIndex + i,
+      programArc: stationState.programArc,
       djLanguage: normalizeDjLanguage(djLanguage),
       hostMode: normalizeHostMode(hostMode),
     });
@@ -771,23 +948,57 @@ function enqueueBridgeJobs({ programId, sessionTitle, tracks, startIndex = 0, pr
 }
 
 async function runProgramStartJob(job) {
+  const timing = metricTimer('program_start');
   const programId = makeProgramId();
   let backupSignal = false;
-  const prompt = buildProgramStartPrompt(job.input || 'Open the station.', job.queueState || '', {
-    djLanguage: job.djLanguage,
-    hostMode: job.hostMode,
-  });
   let result;
-  try {
-    result = await callClaude(prompt);
-  } catch (err) {
-    console.warn(`[program_start] LLM unavailable, using fallback set: ${err.message}`);
-    broadcastSystemLog('warn', 'Starting fallback radio signal', { error: err.message });
-    result = fallbackProgramStartResult(job, err.message);
-    backupSignal = true;
+  let tracks = [];
+  let failedTracks = [];
+  if (job.musicRequest) {
+    broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'phase', phase: 'resolve_audio' });
+    const direct = await resolveDirectMusicRequest(job.musicRequest);
+    tracks = direct.tracks;
+    failedTracks = direct.failedTracks;
+    timing.mark('direct_resolve_audio_ms');
+    if (tracks.length) {
+      result = {
+        title: direct.requestType === 'artist'
+          ? `${job.musicRequest.artist || job.musicRequest.query} Request`
+          : `${tracks[0].title} Request`,
+        play: tracks.map(trackLabel),
+        segments: [],
+        reason: `direct ${direct.requestType} request`,
+      };
+    }
   }
 
-  let { tracks, failedTracks } = await resolveRequestedTracks(result.play || []);
+  if (!tracks.length) {
+    broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'phase', phase: 'choose_tracks' });
+    const prompt = buildProgramStartPrompt(job.input || 'Open the station.', job.queueState || '', {
+      userIntent: job.userIntent,
+      musicRequest: job.musicRequest,
+      programArc: stationState.programArc,
+      correctionContext: job.correctionContext,
+      djLanguage: job.djLanguage,
+      hostMode: job.hostMode,
+    });
+    try {
+      result = await callClaude(prompt);
+      timing.mark('choose_tracks_ms');
+    } catch (err) {
+      console.warn(`[program_start] LLM unavailable, using fallback set: ${err.message}`);
+      broadcastUserSystemLog('warn', 'Starting fallback radio signal', { error: err.message });
+      result = fallbackProgramStartResult(job, err.message);
+      backupSignal = true;
+      timing.mark('choose_tracks_fallback_ms');
+    }
+
+    broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'phase', phase: 'resolve_audio' });
+    const resolved = await resolveRequestedTracks(result.play || []);
+    tracks = resolved.tracks;
+    failedTracks = [...failedTracks, ...resolved.failedTracks];
+    timing.mark('resolve_audio_ms');
+  }
   if (!tracks.length) {
     console.warn('[program_start] No playable tracks from generated set; using fallback set.');
     const fallbackResult = fallbackProgramStartResult(job, 'no playable generated tracks');
@@ -798,39 +1009,76 @@ async function runProgramStartJob(job) {
       failedTracks = [...failedTracks, ...fallbackResolved.failedTracks];
       backupSignal = true;
     }
+    timing.mark('fallback_resolve_audio_ms');
   }
 
-  let coldOpenSegments = (result.segments || []).filter(segment => segment?.type === 'cold_open');
-  let coldOpenReason = result.reason;
   if (tracks.length) {
-    const coldOpenPrompt = buildColdOpenForTracksPrompt({
-      programTitle: result.title || '',
-      tracks,
+    stationState.programId = programId;
+    stationState.sessionTitle = result.title || '';
+    stationState.tracks = tracks;
+    stationState.programArc = createProgramArc({
       userInput: job.input || 'Open the station.',
+      userIntent: job.userIntent,
+      title: result.title || '',
+      tracks,
+      correctionContext: job.correctionContext,
+    });
+    stationState.lastCorrectionContext = job.correctionContext || null;
+    nowPlaying = { title: tracks[0].title, artist: tracks[0].artist, startedAt: Date.now() };
+    timing.mark('first_music_ready_ms');
+
+    const payload = {
+      type: 'program-start',
+      programId,
+      tracks,
+      segments: [],
+      sessionTitle: result.title || '',
+      stationName: STATION_NAME,
+      programName: PROGRAM_NAME,
+      programArc: stationState.programArc,
+      failedTracks,
+      reason: result.reason,
+      signal: backupSignal ? 'backup' : 'live',
+      openingPending: true,
+      metrics: timing.snapshot({ firstMusicReady: true }),
+    };
+    broadcast(payload);
+
+    enqueueJob({
+      type: 'opening_generation',
+      key: `opening:${programId}`,
+      priority: 'high',
+      programId,
+      result,
+      tracks,
+      failedTracks,
+      input: job.input,
+      userIntent: job.userIntent,
+      musicRequest: job.musicRequest,
+      correctionContext: job.correctionContext,
+      programArc: stationState.programArc,
       djLanguage: job.djLanguage,
       hostMode: job.hostMode,
     });
-    try {
-      const coldOpenScript = await callClaude(coldOpenPrompt);
-      coldOpenSegments = Array.isArray(coldOpenScript.segments) ? coldOpenScript.segments : coldOpenSegments;
-      coldOpenReason = coldOpenScript.reason || coldOpenReason;
-    } catch (err) {
-      console.warn(`[program_start] Cold open LLM unavailable, using existing intro: ${err.message}`);
-      coldOpenReason = coldOpenReason || `cold open fallback: ${err.message}`;
-    }
+    enqueueBridgeJobs({ programId, sessionTitle: result.title || '', tracks, startIndex: 0, djLanguage: job.djLanguage, hostMode: job.hostMode });
+    return payload;
   }
-  const coldOpenResult = {
-    ...result,
-    segments: [
-      programStartIdSegment(programId),
-      ...coldOpenSegments,
-    ],
-  };
+
+  broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'phase', phase: 'voice_open' });
+  const coldOpenResult = result || fallbackProgramStartResult(job, 'no playable tracks');
   const segments = await synthesizeSegments(normalizeSegments(coldOpenResult, tracks, false, failedTracks));
 
   stationState.programId = programId;
-  stationState.sessionTitle = result.title || '';
+  stationState.sessionTitle = coldOpenResult.title || '';
   stationState.tracks = tracks;
+  stationState.programArc = createProgramArc({
+    userInput: job.input || 'Open the station.',
+    userIntent: job.userIntent,
+    title: coldOpenResult.title || '',
+    tracks,
+    correctionContext: job.correctionContext,
+  });
+  stationState.lastCorrectionContext = job.correctionContext || null;
   if (tracks.length) nowPlaying = { title: tracks[0].title, artist: tracks[0].artist, startedAt: Date.now() };
   addMessage('claudio', segments.filter(s => s.text).map(s => s.text).join('\n\n'));
 
@@ -839,20 +1087,88 @@ async function runProgramStartJob(job) {
     programId,
     tracks,
     segments,
-    sessionTitle: result.title || '',
+    sessionTitle: coldOpenResult.title || '',
     stationName: STATION_NAME,
     programName: PROGRAM_NAME,
+    programArc: stationState.programArc,
     failedTracks,
-    reason: coldOpenReason,
+    reason: coldOpenResult.reason,
     signal: backupSignal ? 'backup' : 'live',
+    metrics: timing.snapshot({ firstMusicReady: false }),
   };
   broadcast(payload);
 
-  enqueueBridgeJobs({ programId, sessionTitle: result.title || '', tracks, startIndex: 0, djLanguage: job.djLanguage, hostMode: job.hostMode });
   return payload;
 }
 
+async function runOpeningGenerationJob(job) {
+  const timing = metricTimer('opening_generation');
+  const result = job.result || {};
+  const tracks = Array.isArray(job.tracks) ? job.tracks : [];
+  let coldOpenSegments = (result.segments || []).filter(segment => segment?.type === 'cold_open');
+  let coldOpenReason = result.reason;
+
+  broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'phase', phase: 'write_open' });
+  const coldOpenPrompt = buildColdOpenForTracksPrompt({
+    programTitle: result.title || '',
+    tracks,
+    userInput: job.input || 'Open the station.',
+    userIntent: job.userIntent,
+    musicRequest: job.musicRequest,
+    programArc: job.programArc || stationState.programArc,
+    correctionContext: job.correctionContext,
+    djLanguage: job.djLanguage,
+    hostMode: job.hostMode,
+  });
+  try {
+    const coldOpenScript = await callClaude(coldOpenPrompt);
+    coldOpenSegments = Array.isArray(coldOpenScript.segments) ? coldOpenScript.segments : coldOpenSegments;
+    coldOpenReason = coldOpenScript.reason || coldOpenReason;
+    timing.mark('write_open_ms');
+  } catch (err) {
+    console.warn(`[opening_generation] Cold open LLM unavailable, using existing intro: ${err.message}`);
+    coldOpenReason = coldOpenReason || `cold open fallback: ${err.message}`;
+    timing.mark('write_open_fallback_ms');
+  }
+
+  broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'phase', phase: 'voice_open' });
+  const coldOpenResult = {
+    ...result,
+    segments: [
+      programStartIdSegment(job.programId),
+      ...coldOpenSegments,
+    ],
+  };
+  const segments = await synthesizeSegments(normalizeSegments(coldOpenResult, tracks, false, job.failedTracks || []));
+  timing.mark('voice_open_ms');
+
+  const liveOpeningSegments = segments.map((segment, index) => {
+    if (segment.position !== 'before_track' || segment.trackIndex !== 0) return segment;
+    const { trackIndex, ...rest } = segment;
+    return {
+      ...rest,
+      id: `${segment.id}_live`,
+      position: 'immediate',
+      resetClockOnSpeak: index === 0,
+    };
+  });
+
+  if (liveOpeningSegments.some(s => s.text)) {
+    addMessage('claudio', liveOpeningSegments.filter(s => s.text).map(s => s.text).join('\n\n'));
+  }
+  broadcast({
+    type: 'segment-ready',
+    programId: job.programId || stationState.programId,
+    segments: liveOpeningSegments,
+    reason: coldOpenReason,
+    opening: true,
+    metrics: timing.snapshot(),
+  });
+  return liveOpeningSegments;
+}
+
 async function runMusicRefillJob(job) {
+  const timing = metricTimer('music_refill');
   const programId = job.programId || stationState.programId || makeProgramId();
   const queue = normalizeTracksForPrompt(job.queue || stationState.tracks);
   const prompt = buildMusicRefillPrompt({
@@ -861,9 +1177,12 @@ async function runMusicRefillJob(job) {
     queue,
     count: job.count || REFILL_TRACK_COUNT,
     hostMode: job.hostMode,
+    programArc: stationState.programArc,
   });
   const result = await callClaude(prompt);
+  timing.mark('choose_tracks_ms');
   const { tracks, failedTracks } = await resolveRequestedTracks(result.play || [], { queue });
+  timing.mark('resolve_audio_ms');
   const startIndex = Number.isInteger(job.queueLength) ? job.queueLength : stationState.tracks.length;
   const previousTrack = job.previousTrack || stationState.tracks[stationState.tracks.length - 1] || null;
   const previousIndex = Number.isInteger(job.previousIndex) ? job.previousIndex : startIndex - 1;
@@ -871,6 +1190,10 @@ async function runMusicRefillJob(job) {
   stationState.programId = programId;
   stationState.sessionTitle = job.sessionTitle || stationState.sessionTitle || result.title || '';
   stationState.tracks = [...stationState.tracks, ...tracks];
+  stationState.programArc = extendProgramArc(stationState.programArc, {
+    tracksAdded: tracks.length,
+    reason: result.reason,
+  });
 
   const payload = {
     type: 'tracks-ready',
@@ -879,6 +1202,8 @@ async function runMusicRefillJob(job) {
     startIndex,
     failedTracks,
     reason: result.reason,
+    programArc: stationState.programArc,
+    metrics: timing.snapshot(),
   };
   broadcast(payload);
   enqueueBridgeJobs({ programId, sessionTitle: stationState.sessionTitle, tracks, startIndex, previousTrack, previousIndex, djLanguage: job.djLanguage, hostMode: job.hostMode });
@@ -886,6 +1211,7 @@ async function runMusicRefillJob(job) {
 }
 
 async function runBridgeGenerationJob(job) {
+  const timing = metricTimer('bridge_generation');
   const prompt = buildBridgePrompt({
     programTitle: job.sessionTitle || stationState.sessionTitle,
     afterTrack: job.afterTrack,
@@ -894,8 +1220,10 @@ async function runBridgeGenerationJob(job) {
     beforeTrackIndex: job.beforeTrackIndex,
     djLanguage: job.djLanguage,
     hostMode: job.hostMode,
+    programArc: job.programArc || stationState.programArc,
   });
   const result = await callClaude(prompt);
+  timing.mark('write_bridge_ms');
   let segments = await synthesizeSegments(normalizeSegments(
     result,
     new Array(Math.max(job.beforeTrackIndex + 1, 1)).fill(null),
@@ -920,6 +1248,7 @@ async function runBridgeGenerationJob(job) {
     type: 'segment-ready',
     programId: job.programId || stationState.programId,
     segments,
+    metrics: timing.snapshot(),
   });
   if (segments.some(s => s.text)) addMessage('claudio', segments.filter(s => s.text).map(s => s.text).join('\n\n'));
   return segments;
@@ -934,6 +1263,10 @@ async function runRadioSegment(userInput, intent = {}, skipHistory = false) {
   if (!skipHistory) addMessage('user', userInput);
   const prompt = buildPrompt(userInput, nowPlaying ? JSON.stringify(nowPlaying) : '', {
     mode: intent.mode,
+    userIntent: intent.userIntent,
+    musicRequest: intent.musicRequest,
+    programArc: stationState.programArc,
+    correctionContext: intent.correctionContext,
     djLanguage: intent.djLanguage,
     hostMode: intent.hostMode,
   });
@@ -972,6 +1305,7 @@ async function runRadioSegment(userInput, intent = {}, skipHistory = false) {
     status: speechOnly ? 'speaking' : (tracks.length ? 'queued' : 'speaking'),
     stationName: STATION_NAME,
     programName: PROGRAM_NAME,
+    programArc: stationState.programArc,
     trigger: intent.source || 'user',
     failedTracks,
   };
@@ -1001,6 +1335,11 @@ app.post('/api/chat', async (req, res) => {
   intent.source = autoRefill ? 'autoRefill' : 'user';
   intent.djLanguage = normalizeDjLanguage(djLanguage);
   intent.hostMode = normalizeHostMode(hostMode);
+  const personalizationSignals = captureUserSignal(message, intent, nowPlaying);
+  if (personalizationSignals?.length) {
+    intent.personalizationSignals = personalizationSignals;
+    console.log(`[dj-memory] ${personalizationSignals.join(', ')}`);
+  }
 
   if (intent.action === 'next') {
     broadcast({ type: 'control', action: 'next' });
@@ -1019,14 +1358,47 @@ app.post('/api/chat', async (req, res) => {
     return res.json({ action: 'volume', delta: intent.delta });
   }
 
+  if (intent.userIntent === 'correction' && !autoRefill) {
+    const correctionContext = buildCorrectionContext(message, {
+      nowPlaying,
+      tracks: stationState.tracks,
+      lastMusicIntent: stationState.lastMusicIntent,
+    });
+    const canRecover = correctionContext.target || correctionContext.rejectedTrack || correctionContext.lastMusicIntent;
+    if (canRecover) {
+      stationState.lastCorrectionContext = correctionContext;
+      const accepted = enqueueJob({
+        type: 'program_start',
+        key: `program_start:correction:${Date.now()}`,
+        input: intent.message,
+        source: 'user',
+        userIntent: intent.userIntent,
+        djLanguage: intent.djLanguage,
+        hostMode: intent.hostMode,
+        musicRequest: null,
+        correctionContext,
+      });
+      return res.json({ queued: accepted, jobType: 'program_start', correction: true });
+    }
+  }
+
   if (intent.mode !== 'speech-only') {
+    stationState.lastMusicIntent = {
+      message: intent.message,
+      userIntent: intent.userIntent,
+      musicRequest: intent.musicRequest || null,
+      at: Date.now(),
+    };
     enqueueJob({
       type: 'program_start',
       key: `program_start:${Date.now()}`,
       input: intent.message,
       source: autoRefill ? 'autoRefill' : 'user',
+      userIntent: intent.userIntent,
       djLanguage: intent.djLanguage,
       hostMode: intent.hostMode,
+      musicRequest: intent.musicRequest || null,
+      correctionContext: null,
     });
     return res.json({ queued: true, jobType: 'program_start' });
   }
@@ -1070,13 +1442,17 @@ app.get('/api/now', (req, res) => {
   res.json(nowPlaying || { playing: false });
 });
 
+app.get('/api/program-arc', (req, res) => {
+  res.json(stationState.programArc || { active: false });
+});
+
 app.get('/api/environment', async (req, res) => {
-  res.json(await environmentSnapshot({ refreshWeather: true }));
+  res.json(await environmentSnapshot());
 });
 
 app.post('/api/environment', async (req, res) => {
   updateEnvironment(req.body || {});
-  res.json(await environmentSnapshot({ refreshWeather: true }));
+  res.json(await environmentSnapshot());
 });
 
 app.post('/api/next', async (req, res) => {
@@ -1091,6 +1467,10 @@ app.get('/api/taste', (req, res) => {
   } catch {
     res.status(404).json({ error: 'taste.md not found' });
   }
+});
+
+app.get('/api/dj-memory', (req, res) => {
+  res.json(loadDjMemory());
 });
 
 app.get('/api/plan/today', (req, res) => {
@@ -1203,7 +1583,7 @@ app.post('/api/tts/caller', async (req, res) => {
     console.error('[caller-tts]', err);
     const provider = process.env.CALLER_TTS_PROVIDER || process.env.TTS_PROVIDER || 'volcengine';
     if (provider === 'kokoro' && /fetch failed|ECONNREFUSED|failed/i.test(err.message)) {
-      broadcastSystemLog('error', `tts not started: Kokoro unreachable at ${kokoroBaseUrl()}`, {
+      broadcastUserSystemLog('error', `tts not started: Kokoro unreachable at ${kokoroBaseUrl()}`, {
         error: err.message,
       });
     }

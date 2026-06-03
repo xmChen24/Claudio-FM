@@ -9,13 +9,75 @@ const DEEPSEEK_THINKING = process.env.DEEPSEEK_THINKING || '';
 const GEMINI_BASE_URL = process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta/openai/';
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
 const GEMINI_REASONING_EFFORT = process.env.GEMINI_REASONING_EFFORT || '';
+const DEFAULT_RETRIES = Math.max(0, Number(process.env.LLM_RETRIES || 2));
+const DEFAULT_RETRY_DELAY_MS = Math.max(0, Number(process.env.LLM_RETRY_DELAY_MS || 1200));
 
 async function generateJson(prompt, options = {}) {
-  const provider = options.provider || DEFAULT_PROVIDER;
+  const providers = providerChain(options.provider || DEFAULT_PROVIDER);
+  const failures = [];
+
+  for (const provider of providers) {
+    try {
+      return await callProviderWithRetry(provider, prompt, options);
+    } catch (err) {
+      failures.push(`${provider}: ${err.message}`);
+      console.warn(`[LLM] provider ${provider} failed: ${err.message}`);
+    }
+  }
+
+  throw new Error(`All LLM providers failed: ${failures.join(' | ')}`);
+}
+
+function providerChain(primary) {
+  const configuredFallbacks = splitProviderList(process.env.LLM_FALLBACK_PROVIDERS);
+  const defaults = configuredFallbacks.length
+    ? configuredFallbacks
+    : primary === 'claude_cli'
+      ? []
+      : ['claude_cli'];
+  return [...new Set([primary, ...defaults].filter(Boolean))];
+}
+
+function splitProviderList(value) {
+  return String(value || '')
+    .split(',')
+    .map(provider => provider.trim())
+    .filter(Boolean);
+}
+
+async function callProviderWithRetry(provider, prompt, options = {}) {
+  const maxAttempts = Math.max(1, Number(options.retries ?? DEFAULT_RETRIES) + 1);
+  let lastError;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await callProvider(provider, prompt, options);
+    } catch (err) {
+      lastError = err;
+      if (attempt >= maxAttempts || !isRetryableError(err)) break;
+      const delayMs = DEFAULT_RETRY_DELAY_MS * attempt;
+      console.warn(`[LLM:${provider}] retry ${attempt}/${maxAttempts - 1} after ${err.message}`);
+      await sleep(delayMs);
+    }
+  }
+
+  throw lastError;
+}
+
+function callProvider(provider, prompt, options = {}) {
   if (provider === 'deepseek') return callDeepSeek(prompt, options);
   if (provider === 'gemini') return callGemini(prompt, options);
   if (provider === 'claude_cli') return callClaudeCli(prompt, options);
   throw new Error(`Unsupported LLM_PROVIDER: ${provider}`);
+}
+
+function isRetryableError(err) {
+  const message = String(err?.message || '');
+  return /\b(429|500|502|503|504)\b|timeout|ECONNRESET|ETIMEDOUT|fetch failed/i.test(message);
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 async function callDeepSeek(prompt, options = {}) {

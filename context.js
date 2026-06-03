@@ -2,6 +2,9 @@ const fs = require('fs');
 const path = require('path');
 const { recentPlays, recentMessages } = require('./state');
 const { environmentPromptText } = require('./env-context');
+const { formatDjMemoryForPrompt } = require('./dj-memory');
+const { formatProgramArcForPrompt } = require('./program-arc');
+const { formatCorrectionForPrompt } = require('./dj-correction');
 
 function readFile(filePath) {
   try { return fs.readFileSync(filePath, 'utf-8'); } catch { return ''; }
@@ -12,6 +15,7 @@ function sharedContext({ includeTaste = true, includeDialog = true, recentPlayLi
   const taste = readFile(path.join(__dirname, 'user/taste.md'));
   const routines = readFile(path.join(__dirname, 'user/routines.md'));
   const moodRules = readFile(path.join(__dirname, 'user/mood-rules.md'));
+  const djMemory = formatDjMemoryForPrompt();
   const env = environmentPromptText();
   const plays = recentPlays(recentPlayLimit);
   const historyText = plays.length
@@ -27,10 +31,32 @@ function sharedContext({ includeTaste = true, includeDialog = true, recentPlayLi
     includeTaste ? `# 用户音乐品味\n${taste}` : '',
     routines ? `# 用户作息\n${routines}` : '',
     moodRules ? `# 情绪规则\n${moodRules}` : '',
+    `# 动态 DJ 记忆\n${djMemory}`,
     `# 环境\n${env}`,
     `# 最近播放历史（最近${recentPlayLimit}首）\n${historyText}`,
     dialogText ? `# 最近 on-air / call-in 历史\n${dialogText}` : '',
   ].filter(Boolean).join('\n\n');
+}
+
+function intentDetailText(options = {}) {
+  const lines = [];
+  if (options.userIntent) lines.push(`User intent: ${options.userIntent}`);
+  if (options.musicRequest) {
+    const request = options.musicRequest;
+    lines.push(`Music request type: ${request.kind || 'unknown'}`);
+    if (request.query) lines.push(`Requested query: ${request.query}`);
+    if (request.title) lines.push(`Requested track title: ${request.title}`);
+    if (request.artist) lines.push(`Requested artist: ${request.artist}`);
+  }
+  return lines.join('\n');
+}
+
+function programArcText(options = {}) {
+  return formatProgramArcForPrompt(options.programArc || null);
+}
+
+function correctionText(options = {}) {
+  return formatCorrectionForPrompt(options.correctionContext || null);
 }
 
 function normalizeDjLanguage(language) {
@@ -75,13 +101,19 @@ function buildPrompt(userInput, queueState = '', options = {}) {
   const djLanguage = normalizeDjLanguage(options.djLanguage);
   const hostMode = normalizeHostMode(options.hostMode);
   const intentText = options.mode === 'speech-only'
-    ? 'Intent: speech-only / no-music. Do not recommend, replace, or add songs. Return an empty play array and one immediate quick_touch segment only if Claudio should speak.'
+    ? 'Intent: speech-only / no-music. Answer the listener directly and truthfully. Do not recommend, replace, or add songs. Return an empty play array and one immediate quick_touch segment with the direct reply.'
     : 'Intent: music radio segment. Unless the user asked for one specific song, return a mini set of 2-3 playable songs.';
+  const intentDetails = intentDetailText(options);
+  const arcDetails = programArcText(options);
+  const correctionDetails = correctionText(options);
 
   const parts = [
     sharedContext(),
     queueState ? `# 当前队列状态\n${queueState}` : '',
     `# 当前请求意图\n${intentText}`,
+    intentDetails ? `# 意图细节\n${intentDetails}` : '',
+    arcDetails ? `# 当前节目弧线\n${arcDetails}` : '',
+    correctionDetails ? `# 纠错上下文\n${correctionDetails}` : '',
     `# 用户输入\n${userInput}`,
     [
       'Strictly output JSON only, with no extra text.',
@@ -89,7 +121,8 @@ function buildPrompt(userInput, queueState = '', options = {}) {
       hostModeInstruction(hostMode),
       'The "title" should use the same language as the DJ narration.',
       'The "play" array may keep song titles and artist names in their original language for accurate music search.',
-      'For speech-only / no-music requests, "play" must be [] and segments must not alter the queue.',
+      'For speech-only / no-music requests, "play" must be [] and segments must not alter the queue. If the listener asks a factual or personal question, answer it directly instead of turning it into a station retune.',
+      'For positive_feedback, negative_feedback, correction, or session_context, acknowledge the listener naturally and use the dynamic DJ memory for future tone; do not pretend a new song was requested.',
       'Default to 2–3 songs per set unless the user asks for one specific track.',
       'Do not repeat any song from the recent play history or current queue. Do not include the same song twice in one play array.',
       'Avoid artists that appear in the most recent 5 played songs unless the listener explicitly asked for that artist.',
@@ -109,10 +142,16 @@ function buildPrompt(userInput, queueState = '', options = {}) {
 function buildProgramStartPrompt(userInput, queueState = '', options = {}) {
   const djLanguage = normalizeDjLanguage(options.djLanguage);
   const hostMode = normalizeHostMode(options.hostMode);
+  const intentDetails = intentDetailText(options);
+  const arcDetails = programArcText(options);
+  const correctionDetails = correctionText(options);
   return [
     sharedContext(),
     queueState ? `# 当前队列状态\n${queueState}` : '',
     `# 电台任务\nprogram_start：开播。只生成节目标题、2-3 首歌、以及 cold_open 句级播报。不要生成 bridge、back_announce 或 quick_touch。`,
+    intentDetails ? `# 意图细节\n${intentDetails}` : '',
+    arcDetails ? `# 当前节目弧线\n${arcDetails}` : '',
+    correctionDetails ? `# 纠错上下文\n${correctionDetails}` : '',
     `# 用户输入 / 启动意图\n${userInput}`,
     [
       'Strictly output JSON only, with no extra text.',
@@ -123,6 +162,8 @@ function buildProgramStartPrompt(userInput, queueState = '', options = {}) {
       'The "play" array must contain 2-3 songs in "song title - artist" format. Keep original-language titles/artists for search.',
       'Do not repeat any song from the recent play history or current queue. Do not include the same song twice in one play array.',
       'Avoid artists that appear in the most recent 5 played songs unless the listener explicitly asked for that artist.',
+      'Use dynamic DJ memory as taste and tone guidance, but do not mention the memory system.',
+      'If correction context is present, recover from the rejected lane and do not choose the rejected current track or artist unless explicitly required.',
       'The "segments" array must contain only cold_open segments for trackIndex 0.',
       'Write 3-5 consecutive cold_open segments, each one sentence, same position before_track and trackIndex 0.',
       coldOpenLengthInstruction(djLanguage),
@@ -133,9 +174,12 @@ function buildProgramStartPrompt(userInput, queueState = '', options = {}) {
   ].filter(Boolean).join('\n\n');
 }
 
-function buildColdOpenForTracksPrompt({ programTitle = '', tracks = [], userInput = '', djLanguage = 'en', hostMode = 'story' } = {}) {
+function buildColdOpenForTracksPrompt({ programTitle = '', tracks = [], userInput = '', djLanguage = 'en', hostMode = 'story', userIntent = '', musicRequest = null, programArc = null, correctionContext = null } = {}) {
   const normalizedLanguage = normalizeDjLanguage(djLanguage);
   const normalizedHostMode = normalizeHostMode(hostMode);
+  const intentDetails = intentDetailText({ userIntent, musicRequest });
+  const arcDetails = programArcText({ programArc });
+  const correctionDetails = correctionText({ correctionContext });
   const trackText = tracks.length
     ? tracks.map((track, i) => `${i}. ${track.title || track.query}${track.artist ? ' — ' + track.artist : ''}`).join('\n')
     : '（无可播放歌曲）';
@@ -144,6 +188,9 @@ function buildColdOpenForTracksPrompt({ programTitle = '', tracks = [], userInpu
     sharedContext({ includeDialog: true, recentPlayLimit: 12 }),
     `# 电台任务\ncold_open_for_resolved_tracks：根据已经确认可播放的真实歌曲生成开场播报。`,
     programTitle ? `# 当前节目标题\n${programTitle}` : '',
+    intentDetails ? `# 意图细节\n${intentDetails}` : '',
+    arcDetails ? `# 当前节目弧线\n${arcDetails}` : '',
+    correctionDetails ? `# 纠错上下文\n${correctionDetails}` : '',
     userInput ? `# 用户输入 / 启动意图\n${userInput}` : '',
     `# 已确认可播放歌曲（必须以此为准）\n${trackText}`,
     [
@@ -163,8 +210,9 @@ function buildColdOpenForTracksPrompt({ programTitle = '', tracks = [], userInpu
   ].filter(Boolean).join('\n\n');
 }
 
-function buildMusicRefillPrompt({ programTitle = '', currentTrack = null, queue = [], count = 3, hostMode = 'story' } = {}) {
+function buildMusicRefillPrompt({ programTitle = '', currentTrack = null, queue = [], count = 3, hostMode = 'story', programArc = null } = {}) {
   const normalizedHostMode = normalizeHostMode(hostMode);
+  const arcDetails = programArcText({ programArc });
   const queueText = queue.length
     ? queue.map((t, i) => `${i + 1}. ${t.title || t.query}${t.artist ? ' — ' + t.artist : ''}`).join('\n')
     : '（当前队列为空）';
@@ -173,6 +221,7 @@ function buildMusicRefillPrompt({ programTitle = '', currentTrack = null, queue 
     sharedContext({ includeDialog: false, recentPlayLimit: 20 }),
     `# 电台任务\nmusic_refill：只为当前电台补 ${count} 首歌。不要生成任何听众可见 DJ 播报。`,
     `# 当前节目\n${programTitle || 'Untitled program'}`,
+    arcDetails ? `# 当前节目弧线\n${arcDetails}` : '',
     `# 当前正在播\n${currentText}`,
     `# 当前前端队列\n${queueText}`,
     [
@@ -180,6 +229,7 @@ function buildMusicRefillPrompt({ programTitle = '', currentTrack = null, queue 
       'Return only: {"play":["song - artist"],"reason":"internal reason"}.',
       hostModeInstruction(normalizedHostMode),
       `Return ${count} songs unless the queue context makes fewer safer.`,
+      'Use the current program arc to continue the set instead of making an unrelated recommendation jump.',
       'Do not include segments, say, intros, or listener-facing explanations.',
       'Keep song titles and artist names in original language for accurate search.',
       'Do not repeat any song from the current queue or recent play history.',
@@ -189,15 +239,17 @@ function buildMusicRefillPrompt({ programTitle = '', currentTrack = null, queue 
   ].filter(Boolean).join('\n\n');
 }
 
-function buildBridgePrompt({ programTitle = '', afterTrack, beforeTrack, afterTrackIndex, beforeTrackIndex, recentLines = '', djLanguage = 'en', hostMode = 'story' }) {
+function buildBridgePrompt({ programTitle = '', afterTrack, beforeTrack, afterTrackIndex, beforeTrackIndex, recentLines = '', djLanguage = 'en', hostMode = 'story', programArc = null }) {
   const normalizedLanguage = normalizeDjLanguage(djLanguage);
   const normalizedHostMode = normalizeHostMode(hostMode);
+  const arcDetails = programArcText({ programArc });
   const afterText = `${afterTrack?.title || afterTrack?.query || 'previous track'}${afterTrack?.artist ? ' — ' + afterTrack.artist : ''}`;
   const beforeText = `${beforeTrack?.title || beforeTrack?.query || 'next track'}${beforeTrack?.artist ? ' — ' + beforeTrack.artist : ''}`;
   return [
     sharedContext({ includeTaste: false, includeDialog: false, recentPlayLimit: 8 }),
     `# 电台任务\nbridge_generation：只生成从上一首到下一首的歌曲缝隙播报，或明确选择 silence。`,
     `# 当前节目\n${programTitle || 'Untitled program'}`,
+    arcDetails ? `# 当前节目弧线\n${arcDetails}` : '',
     `# 上一首\nindex ${afterTrackIndex}: ${afterText}`,
     `# 下一首\nindex ${beforeTrackIndex}: ${beforeText}`,
     recentLines ? `# 最近播报摘要\n${recentLines}` : '',

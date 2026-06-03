@@ -14,6 +14,15 @@ function splitQuery(query) {
   };
 }
 
+function normalizeSearchText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .normalize('NFKC')
+    .replace(/[^\p{Letter}\p{Number}]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function withTimeout(timeoutMs = DEFAULT_TIMEOUT_MS) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -126,19 +135,91 @@ async function searchSpotify(query) {
     const data = await spotifyGet('/search', {
       q,
       type: 'track',
-      limit: 1,
+      limit: 5,
       market,
       include_external: 'audio',
     });
-    const track = normalizeTrack(data?.tracks?.items?.[0], query);
+    const items = Array.isArray(data?.tracks?.items) ? data.tracks.items : [];
+    const track = chooseBestTrack(items, { title, artist, query });
     if (track) return track;
   }
 
   return null;
 }
 
+function chooseBestTrack(items, request) {
+  if (!items.length) return null;
+  const requestedTitle = normalizeSearchText(request.title || request.query);
+  const requestedArtist = normalizeSearchText(request.artist);
+  let best = null;
+  let bestScore = -1;
+
+  for (const item of items) {
+    const track = normalizeTrack(item, request.query);
+    if (!track) continue;
+    const title = normalizeSearchText(track.title);
+    const artists = normalizeSearchText(track.artist);
+    let score = 0;
+    if (requestedTitle && title === requestedTitle) score += 100;
+    else if (requestedTitle && title.includes(requestedTitle)) score += 60;
+    else if (requestedTitle && requestedTitle.includes(title)) score += 40;
+    if (requestedArtist && artists.includes(requestedArtist)) score += 80;
+    if (!requestedArtist && requestedTitle && title.startsWith(requestedTitle)) score += 10;
+    if (track.spotifyUri) score += 1;
+    if (score > bestScore) {
+      best = track;
+      bestScore = score;
+    }
+  }
+
+  return best || normalizeTrack(items[0], request.query);
+}
+
+async function getArtistTracks(query, count = 3) {
+  try {
+    const market = process.env.SPOTIFY_MARKET || 'US';
+    const artistName = String(query || '').trim();
+    const normalizedArtist = normalizeSearchText(artistName);
+    if (!normalizedArtist) return [];
+    const data = await spotifyGet('/search', {
+      q: artistName,
+      type: 'track',
+      limit: 10,
+      market,
+      include_external: 'audio',
+    });
+    const items = (Array.isArray(data?.tracks?.items) ? data.tracks.items : [])
+      .filter(item => {
+        const artists = Array.isArray(item?.artists) ? item.artists.map(a => a.name).join(' ') : '';
+        return normalizeSearchText(artists).includes(normalizedArtist);
+      });
+    const tracks = [];
+    for (const item of items) {
+      const track = normalizeTrack(item, `${item?.name || ''} - ${artistName}`);
+      if (!track) continue;
+      const streamUrl = await resolveStreamUrl(track);
+      tracks.push({
+        ...track,
+        artist: track.artist || artistName,
+        query: `${track.title} - ${artistName}`,
+        streamUrl: streamUrl || '',
+        lyrics: null,
+      });
+      if (tracks.length >= count) break;
+    }
+    return tracks;
+  } catch (err) {
+    console.warn('[spotify] artist lookup failed:', err.message);
+    return [];
+  }
+}
+
 async function resolveStreamUrl(track) {
   const fallbackProvider = process.env.MUSIC_FALLBACK_PROVIDER || 'yt-dlp';
+
+  if (process.env.SPOTIFY_FAST_START === '1' && track.spotifyUri) {
+    return null;
+  }
 
   if (fallbackProvider === 'yt-dlp') {
     const lookup = `${track.title}${track.artist ? ' - ' + track.artist : ''}`;
@@ -177,5 +258,6 @@ async function getTrack(query) {
 module.exports = {
   getAccessToken,
   getTrack,
+  getArtistTracks,
   searchSpotify,
 };
