@@ -18,6 +18,38 @@ function normalizeSearchText(value) {
   return String(value || '')
     .toLowerCase()
     .normalize('NFKC')
+    .replace(/[這麼們個愛聽與夢風雲臺台裡裏為無後會國樂歡聲當讓開關過還點對萬]/g, char => ({
+      '這': '这',
+      '麼': '么',
+      '們': '们',
+      '個': '个',
+      '愛': '爱',
+      '聽': '听',
+      '與': '与',
+      '夢': '梦',
+      '風': '风',
+      '雲': '云',
+      '臺': '台',
+      '裡': '里',
+      '裏': '里',
+      '為': '为',
+      '無': '无',
+      '後': '后',
+      '會': '会',
+      '國': '国',
+      '樂': '乐',
+      '歡': '欢',
+      '聲': '声',
+      '當': '当',
+      '讓': '让',
+      '開': '开',
+      '關': '关',
+      '過': '过',
+      '還': '还',
+      '點': '点',
+      '對': '对',
+      '萬': '万',
+    }[char] || char))
     .replace(/[^\p{Letter}\p{Number}]+/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -159,12 +191,9 @@ function chooseBestTrack(items, request) {
     if (!track) continue;
     const title = normalizeSearchText(track.title);
     const artists = normalizeSearchText(track.artist);
-    let score = 0;
-    if (requestedTitle && title === requestedTitle) score += 100;
-    else if (requestedTitle && title.includes(requestedTitle)) score += 60;
-    else if (requestedTitle && requestedTitle.includes(title)) score += 40;
-    if (requestedArtist && artists.includes(requestedArtist)) score += 80;
-    if (!requestedArtist && requestedTitle && title.startsWith(requestedTitle)) score += 10;
+    const titleScore = titleMatchScore(requestedTitle, title);
+    const artistScore = artistMatchScore(requestedArtist, artists);
+    let score = titleScore + artistScore;
     if (track.spotifyUri) score += 1;
     if (score > bestScore) {
       best = track;
@@ -172,7 +201,31 @@ function chooseBestTrack(items, request) {
     }
   }
 
-  return best || normalizeTrack(items[0], request.query);
+  const requiredScore = requestedArtist ? 80 : 55;
+  return bestScore >= requiredScore ? best : null;
+}
+
+function titleMatchScore(requestedTitle, title) {
+  if (!requestedTitle || !title) return 0;
+  if (title === requestedTitle) return 120;
+  if (title.includes(requestedTitle)) return 95;
+  if (requestedTitle.includes(title) && title.length >= 2) return 80;
+  const requestedTokens = requestedTitle.split(' ').filter(Boolean);
+  const titleTokens = title.split(' ').filter(Boolean);
+  if (!requestedTokens.length || !titleTokens.length) return 0;
+  const overlap = requestedTokens.filter(token => titleTokens.includes(token)).length;
+  const ratio = overlap / Math.max(requestedTokens.length, 1);
+  if (ratio >= 0.8) return 70;
+  if (ratio >= 0.5) return 45;
+  return 0;
+}
+
+function artistMatchScore(requestedArtist, artists) {
+  if (!requestedArtist) return 0;
+  if (!artists) return 0;
+  if (artists === requestedArtist) return 90;
+  if (artists.includes(requestedArtist) || requestedArtist.includes(artists)) return 80;
+  return 0;
 }
 
 async function getArtistTracks(query, count = 3) {

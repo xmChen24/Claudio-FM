@@ -733,6 +733,38 @@ function normalizeTrackText(value) {
   return String(value || '')
     .toLowerCase()
     .normalize('NFKC')
+    .replace(/[這麼們個愛聽與夢風雲臺台裡裏為無後會國樂歡聲當讓開關過還點對萬]/g, char => ({
+      '這': '这',
+      '麼': '么',
+      '們': '们',
+      '個': '个',
+      '愛': '爱',
+      '聽': '听',
+      '與': '与',
+      '夢': '梦',
+      '風': '风',
+      '雲': '云',
+      '臺': '台',
+      '裡': '里',
+      '裏': '里',
+      '為': '为',
+      '無': '无',
+      '後': '后',
+      '會': '会',
+      '國': '国',
+      '樂': '乐',
+      '歡': '欢',
+      '聲': '声',
+      '當': '当',
+      '讓': '让',
+      '開': '开',
+      '關': '关',
+      '過': '过',
+      '還': '还',
+      '點': '点',
+      '對': '对',
+      '萬': '万',
+    }[char] || char))
     .replace(/[^\p{Letter}\p{Number}]+/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -763,15 +795,34 @@ function trackMatchesRequest(requested, resolved) {
   const resolvedArtist = normalizeTrackText(resolved.artist);
   if (!requestedTitle || !resolvedTitle) return true;
 
-  const titleMatches = requestedTitle === resolvedTitle ||
-    requestedTitle.includes(resolvedTitle) ||
-    resolvedTitle.includes(requestedTitle);
+  const titleScore = titleMatchScore(requestedTitle, resolvedTitle);
+  const titleMatches = titleScore >= 70;
   const artistMatches = !requestedArtist || !resolvedArtist ||
     requestedArtist === resolvedArtist ||
     requestedArtist.includes(resolvedArtist) ||
     resolvedArtist.includes(requestedArtist);
+  const allowCjkArtistAlias = Boolean(requestedArtist && hasCjk(requested.artist) && titleScore >= 95);
 
-  return titleMatches && artistMatches;
+  return titleMatches && (artistMatches || allowCjkArtistAlias);
+}
+
+function titleMatchScore(requestedTitle, resolvedTitle) {
+  if (!requestedTitle || !resolvedTitle) return 0;
+  if (requestedTitle === resolvedTitle) return 120;
+  if (resolvedTitle.includes(requestedTitle)) return 100;
+  if (requestedTitle.includes(resolvedTitle) && resolvedTitle.length >= 2) return 85;
+  const requestedTokens = requestedTitle.split(' ').filter(Boolean);
+  const resolvedTokens = resolvedTitle.split(' ').filter(Boolean);
+  if (!requestedTokens.length || !resolvedTokens.length) return 0;
+  const overlap = requestedTokens.filter(token => resolvedTokens.includes(token)).length;
+  const ratio = overlap / Math.max(requestedTokens.length, 1);
+  if (ratio >= 0.8) return 75;
+  if (ratio >= 0.5) return 50;
+  return 0;
+}
+
+function hasCjk(value) {
+  return /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(String(value || ''));
 }
 
 function payloadTrackFromResolved(query, requested, track) {
@@ -930,6 +981,11 @@ async function resolveDirectMusicRequest(request = {}) {
   }
 
   const requested = parseRequestedTrack(trackQuery);
+  if (request.kind === 'track' && !trackMatchesRequest(requested, track)) {
+    failedTracks.push(`${trackQuery} (resolved mismatch: ${track.title}${track.artist ? ' — ' + track.artist : ''})`);
+    console.log(`[点歌] ↷ 跳过错配: 请求 "${trackQuery}"，返回 "${track.title}${track.artist ? ' — ' + track.artist : ''}"`);
+    return { tracks: [], failedTracks, requestType: 'track' };
+  }
   const payloadTrack = payloadTrackFromResolved(trackQuery, requested, track);
   addPlay({ title: payloadTrack.title, artist: payloadTrack.artist, source_url: payloadTrack.streamUrl || payloadTrack.spotifyUri });
   console.log(`[点歌] ✓ 找到曲目: ${payloadTrack.title}${payloadTrack.artist ? ' — ' + payloadTrack.artist : ''}`);
