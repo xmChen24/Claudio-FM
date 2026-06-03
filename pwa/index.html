@@ -1578,7 +1578,7 @@ function playbackCurrentTime() {
 }
 
 function playbackIsEmpty() {
-  return spotifyActive ? !spotifyTrackDurationMs : (!musicAudio.src || musicAudio.ended);
+  return spotifyActive ? spotifyPaused : (!musicAudio.src || musicAudio.ended);
 }
 
 function clearSpotifyTimers() {
@@ -2117,6 +2117,7 @@ let requestLineActive = false;
 let voiceObjectActive = false;
 let voiceSequenceActive = false;
 let programClockStartedAt = null;
+let currentTrackStartedAt = 0;
 let currentProgramId = null;
 let lastRefillAt = 0;
 renderStationContext();
@@ -2250,6 +2251,7 @@ function resetProgramPlaybackState() {
   autoRefilling = false;
   segueStarted = false;
   awaitingNextTrack = false;
+  currentTrackStartedAt = 0;
   voiceObjectActive = false;
   voiceSequenceActive = false;
   requestLineActive = false;
@@ -2518,6 +2520,7 @@ function autoRefill() {
 
 async function playTrack(track) {
   awaitingNextTrack = false;
+  currentTrackStartedAt = Date.now();
   renderQueue();
   const title = trackTitle(track);
   nowPlayingTitle.textContent = track.artist ? `${title} — ${track.artist}` : title;
@@ -2613,9 +2616,8 @@ function playNext() {
   return false;
 }
 
-function enqueueAndPlay(tracks) {
-  if (!tracks?.length) return;
-  const shouldAutoResume = awaitingNextTrack || playbackIsEmpty();
+function enqueueTracks(tracks) {
+  if (!tracks?.length) return [];
   const existingKeys = new Set(queue.map(trackIdentity).filter(Boolean));
   const existingUrls = new Set(queue.map(track => track.streamUrl).filter(Boolean));
   const freshTracks = tracks.filter(track => {
@@ -2626,9 +2628,16 @@ function enqueueAndPlay(tracks) {
     if (url) existingUrls.add(url);
     return true;
   });
-  if (!freshTracks.length) return;
+  if (!freshTracks.length) return [];
   queue = [...queue, ...freshTracks];
   renderQueue();
+  return freshTracks;
+}
+
+function enqueueAndPlay(tracks, { autoPlay = true } = {}) {
+  const shouldAutoResume = autoPlay && (awaitingNextTrack || playbackIsEmpty());
+  const freshTracks = enqueueTracks(tracks);
+  if (!freshTracks.length) return freshTracks;
   if (shouldAutoResume) {
     awaitingNextTrack = false;
     segueStarted = false;
@@ -2636,6 +2645,7 @@ function enqueueAndPlay(tracks) {
     playTrack(queue[queueIdx]);
   }
   maybeRefillAhead();
+  return freshTracks;
 }
 
 function normalizeIncomingSegments(msg) {
@@ -2730,28 +2740,52 @@ function handleWsMessage(msg) {
     const tracks = msg.tracks || [];
     const incomingSegments = offsetSegmentsForQueue(normalizeIncomingSegments(msg), queue.length);
     scriptSegments = [...scriptSegments, ...incomingSegments];
-    if (tracks.length) enqueueAndPlay(tracks);
-    renderStationContext({ signal: msg.signal === 'backup' ? 'backup' : 'live' });
     const immediateSegments = findSegments(segment =>
       segment.position === 'immediate' ||
       (segment.position === 'before_track' && (segment.trackIndex ?? 0) === queueIdx)
     );
+    if (tracks.length && msg.openingLeadIn && immediateSegments.length && playbackIsEmpty()) {
+      const freshTracks = enqueueAndPlay(tracks, { autoPlay: false });
+      renderStationContext({ signal: msg.signal === 'backup' ? 'backup' : 'live' });
+      if (freshTracks.length) {
+        const leadInSegments = immediateSegments.map((segment, index) => ({
+          ...segment,
+          resetClockOnSpeak: index === 0,
+        }));
+        speakSegmentSequence(leadInSegments, () => {
+          if (playbackIsEmpty() && queue[queueIdx]) playTrack(queue[queueIdx]);
+          maybeRefillAhead();
+        });
+        if (msg.openingPending) addSystemLine('Claudio is writing the full opening link…');
+        return;
+      }
+    }
+    if (tracks.length) enqueueAndPlay(tracks);
+    renderStationContext({ signal: msg.signal === 'backup' ? 'backup' : 'live' });
     if (immediateSegments.length) queueImmediateSegments(immediateSegments);
     if (msg.openingPending) addSystemLine('Music is live. Claudio is writing the opening link…');
     return;
   }
 
   if (msg.type === 'tracks-ready') {
+    if (msg.programId && currentProgramId && msg.programId !== currentProgramId) return;
     currentProgramId = msg.programId || currentProgramId;
     autoRefilling = false;
-    if (msg.tracks?.length) enqueueAndPlay(msg.tracks);
+    if (msg.tracks?.length) enqueueAndPlay(msg.tracks, { autoPlay: !msg.tail });
     renderStationContext();
     return;
   }
 
   if (msg.type === 'segment-ready') {
+    if (msg.programId && currentProgramId && msg.programId !== currentProgramId) return;
     currentProgramId = msg.programId || currentProgramId;
     const incomingSegments = normalizeIncomingSegments(msg);
+    if (msg.openingContinuation && currentTrackStartedAt) {
+      const windowMs = Number(msg.continuationWindowMs || 9000);
+      if (Date.now() - currentTrackStartedAt > windowMs) {
+        return;
+      }
+    }
     scriptSegments = [...scriptSegments, ...incomingSegments];
     const immediateSegments = findSegments(segment =>
       segment.position === 'immediate' ||

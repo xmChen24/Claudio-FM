@@ -7,7 +7,7 @@ const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
 const { route } = require('./router');
-const { buildPrompt, buildProgramStartPrompt, buildColdOpenForTracksPrompt, buildMusicRefillPrompt, buildBridgePrompt } = require('./context');
+const { buildPrompt, buildProgramStartPrompt, buildOpeningLeadInPrompt, buildColdOpenForTracksPrompt, buildMusicRefillPrompt, buildBridgePrompt } = require('./context');
 const { callClaude } = require('./claude');
 const { synthesize } = require('./tts');
 const { getTrack, getArtistTracks } = require('./music');
@@ -162,6 +162,27 @@ function metricTimer(label) {
   };
 }
 
+function softTimeout(promise, timeoutMs, label, fallbackValue = null) {
+  let settled = false;
+  const guarded = Promise.resolve(promise)
+    .then(value => {
+      settled = true;
+      return value;
+    })
+    .catch(err => {
+      settled = true;
+      console.warn(`[${label}] ${err.message}`);
+      return fallbackValue;
+    });
+  const timeout = new Promise(resolve => {
+    setTimeout(() => {
+      if (!settled) console.warn(`[${label}] timed out after ${timeoutMs}ms`);
+      resolve(fallbackValue);
+    }, timeoutMs);
+  });
+  return Promise.race([guarded, timeout]);
+}
+
 async function sendTtsUnavailableIfNeeded(ws) {
   if ((process.env.TTS_PROVIDER || 'volcengine') !== 'kokoro') return;
 
@@ -187,13 +208,15 @@ let nowPlaying = null;
 const STATION_NAME = 'Claudio FM';
 const PROGRAM_NAME = 'Evening Drive';
 const REFILL_TRACK_COUNT = 3;
-const PROGRAM_START_ID_TEXT = 'This is Claudio.';
 const TRACK_REPEAT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const ARTIST_RECENT_WINDOW = 5;
 const MUSIC_RESOLVE_CONCURRENCY = Math.max(1, Number(process.env.MUSIC_RESOLVE_CONCURRENCY || 3));
 const TTS_SYNTH_CONCURRENCY = Math.max(1, Number(process.env.TTS_SYNTH_CONCURRENCY || 3));
 const TTS_SYNTH_RETRIES = Math.max(0, Number(process.env.TTS_SYNTH_RETRIES || 2));
 const DIRECT_ARTIST_TRACK_COUNT = Math.max(1, Number(process.env.DIRECT_ARTIST_TRACK_COUNT || 3));
+const OPENING_LEAD_IN_LLM_TIMEOUT_MS = Math.max(500, Number(process.env.OPENING_LEAD_IN_LLM_TIMEOUT_MS || 2200));
+const OPENING_LEAD_IN_TTS_TIMEOUT_MS = Math.max(500, Number(process.env.OPENING_LEAD_IN_TTS_TIMEOUT_MS || 4500));
+const OPENING_CONTINUATION_WINDOW_MS = Math.max(0, Number(process.env.OPENING_CONTINUATION_WINDOW_MS || 9000));
 const FALLBACK_PROGRAM_TRACKS = [
   'Sweet Disposition - The Temper Trap',
   'Ventura Highway - America',
@@ -340,19 +363,6 @@ function buildAnnouncement(result, tracks, failedTracks, speechOnly) {
     return "I couldn't get a clean playable link for that set, so I'm keeping the current signal alive.";
   }
   return '';
-}
-
-function programStartIdSegment(programId) {
-  return {
-    id: `${programId}_station_id`,
-    type: 'cold_open',
-    groupId: 'open_0',
-    part: 'station_id',
-    partIndex: 0,
-    position: 'before_track',
-    trackIndex: 0,
-    text: PROGRAM_START_ID_TEXT,
-  };
 }
 
 function fallbackProgramStartResult(job = {}, reason = '') {
@@ -558,6 +568,102 @@ async function synthesizeSegments(segments) {
 
   await mapWithConcurrency(segments, TTS_SYNTH_CONCURRENCY, synthesizeOne);
   return segments;
+}
+
+function extractLeadInText(value) {
+  if (!value) return '';
+  if (typeof value === 'string') return value.trim();
+  if (typeof value.text === 'string') return value.text.trim();
+  if (typeof value.openingLeadIn === 'string') return value.openingLeadIn.trim();
+  if (value.segment) return extractLeadInText(value.segment);
+  if (Array.isArray(value.segments)) {
+    const segment = value.segments.find(item => item?.text);
+    return extractLeadInText(segment);
+  }
+  return '';
+}
+
+function fallbackOpeningLeadIn(firstTrack, djLanguage = 'en') {
+  const title = firstTrack?.title || firstTrack?.query || '';
+  const artist = firstTrack?.artist || '';
+  const label = artist ? `${title} — ${artist}` : title;
+  const variants = normalizeDjLanguage(djLanguage) === 'zh'
+    ? [
+      label ? `先让 ${label} 把这段信号点亮。` : '先把这段信号轻轻打开。',
+      label ? `从 ${label} 的第一层颜色进来。` : '从第一层声音慢慢进来。',
+      label ? `${label} 会先把房间带进去。` : '让第一首歌先把房间带进去。',
+    ]
+    : [
+      label ? `${label} is where this signal first finds its shape.` : 'The signal opens with a little room to breathe.',
+      label ? `We start inside the first color of ${label}.` : 'We start with the first color of the room.',
+      label ? `${label} gets the room first.` : 'The first record gets the room first.',
+    ];
+  const index = Math.abs(hashText(label || String(Date.now()))) % variants.length;
+  return variants[index];
+}
+
+function hashText(value) {
+  let hash = 0;
+  for (const char of String(value || '')) {
+    hash = ((hash << 5) - hash) + char.charCodeAt(0);
+    hash |= 0;
+  }
+  return hash;
+}
+
+function isStaleProgramJob(job) {
+  return Boolean(job?.programId && stationState.programId && job.programId !== stationState.programId);
+}
+
+async function buildOpeningLeadInSegment(job, result, tracks, programArc, timing) {
+  const firstTrack = tracks[0] || null;
+  if (!firstTrack) return null;
+
+  const prompt = buildOpeningLeadInPrompt({
+    programTitle: result.title || '',
+    firstTrack,
+    userInput: job.input || 'Open the station.',
+    userIntent: job.userIntent,
+    musicRequest: job.musicRequest,
+    programArc,
+    correctionContext: job.correctionContext,
+    djLanguage: job.djLanguage,
+    hostMode: job.hostMode,
+    seed: result.openingLeadIn || '',
+  });
+
+  const leadInResult = await softTimeout(
+    callClaude(prompt),
+    OPENING_LEAD_IN_LLM_TIMEOUT_MS,
+    'opening_lead_in',
+    null
+  );
+  if (leadInResult) timing.mark('lead_in_write_ms');
+
+  const text = extractLeadInText(leadInResult) ||
+    extractLeadInText(result.openingLeadIn) ||
+    fallbackOpeningLeadIn(firstTrack, job.djLanguage);
+  if (!text) return null;
+
+  const segment = normalizeSegment({
+    type: 'cold_open',
+    groupId: 'open_0',
+    part: 'lead_in',
+    partIndex: 0,
+    position: 'before_track',
+    trackIndex: 0,
+    text,
+  }, 0, tracks.length);
+
+  const synthesized = await softTimeout(
+    synthesizeSegments([segment]),
+    OPENING_LEAD_IN_TTS_TIMEOUT_MS,
+    'opening_lead_in_tts',
+    null
+  );
+  if (!synthesized?.[0]?.ttsUrl) return null;
+  timing.mark('lead_in_voice_ms');
+  return synthesized[0];
 }
 
 async function synthesizeWithRetry(text, options = {}) {
@@ -780,6 +886,23 @@ async function resolveRequestedTracks(requestedTracks, options = {}) {
   return { tracks, failedTracks };
 }
 
+async function resolveFirstPlayableTrack(requestedTracks, options = {}) {
+  const requested = Array.isArray(requestedTracks) ? requestedTracks.filter(Boolean) : [];
+  const failedTracks = [];
+  for (let i = 0; i < requested.length; i++) {
+    const resolved = await resolveRequestedTracks([requested[i]], options);
+    failedTracks.push(...resolved.failedTracks);
+    if (resolved.tracks.length) {
+      return {
+        tracks: resolved.tracks,
+        failedTracks,
+        remainingPlay: requested.slice(i + 1),
+      };
+    }
+  }
+  return { tracks: [], failedTracks, remainingPlay: [] };
+}
+
 async function resolveDirectMusicRequest(request = {}) {
   const failedTracks = [];
   const rawQuery = String(request.query || request.title || request.artist || '').trim();
@@ -909,6 +1032,7 @@ async function drainBackgroundJobs() {
 async function runJob(job) {
   if (job.type === 'program_start') return runProgramStartJob(job);
   if (job.type === 'opening_generation') return runOpeningGenerationJob(job);
+  if (job.type === 'music_tail_resolve') return runMusicTailResolveJob(job);
   if (job.type === 'music_refill') return runMusicRefillJob(job);
   if (job.type === 'bridge_generation') return runBridgeGenerationJob(job);
   throw new Error(`Unknown job type: ${job.type}`);
@@ -954,6 +1078,7 @@ async function runProgramStartJob(job) {
   let result;
   let tracks = [];
   let failedTracks = [];
+  let remainingPlay = [];
   if (job.musicRequest) {
     broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'phase', phase: 'resolve_audio' });
     const direct = await resolveDirectMusicRequest(job.musicRequest);
@@ -994,19 +1119,21 @@ async function runProgramStartJob(job) {
     }
 
     broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'phase', phase: 'resolve_audio' });
-    const resolved = await resolveRequestedTracks(result.play || []);
+    const resolved = await resolveFirstPlayableTrack(result.play || []);
     tracks = resolved.tracks;
     failedTracks = [...failedTracks, ...resolved.failedTracks];
+    remainingPlay = resolved.remainingPlay;
     timing.mark('resolve_audio_ms');
   }
   if (!tracks.length) {
     console.warn('[program_start] No playable tracks from generated set; using fallback set.');
     const fallbackResult = fallbackProgramStartResult(job, 'no playable generated tracks');
-    const fallbackResolved = await resolveRequestedTracks(fallbackResult.play, { enforceAvoidance: false });
+    const fallbackResolved = await resolveFirstPlayableTrack(fallbackResult.play, { enforceAvoidance: false });
     if (fallbackResolved.tracks.length) {
       result = fallbackResult;
       tracks = fallbackResolved.tracks;
       failedTracks = [...failedTracks, ...fallbackResolved.failedTracks];
+      remainingPlay = fallbackResolved.remainingPlay;
       backupSignal = true;
     }
     timing.mark('fallback_resolve_audio_ms');
@@ -1026,12 +1153,16 @@ async function runProgramStartJob(job) {
     stationState.lastCorrectionContext = job.correctionContext || null;
     nowPlaying = { title: tracks[0].title, artist: tracks[0].artist, startedAt: Date.now() };
     timing.mark('first_music_ready_ms');
+    const leadInSegment = await buildOpeningLeadInSegment(job, result, tracks, stationState.programArc, timing);
+    if (leadInSegment?.text) {
+      addMessage('claudio', leadInSegment.text);
+    }
 
     const payload = {
       type: 'program-start',
       programId,
       tracks,
-      segments: [],
+      segments: leadInSegment ? [leadInSegment] : [],
       sessionTitle: result.title || '',
       stationName: STATION_NAME,
       programName: PROGRAM_NAME,
@@ -1040,6 +1171,8 @@ async function runProgramStartJob(job) {
       reason: result.reason,
       signal: backupSignal ? 'backup' : 'live',
       openingPending: true,
+      openingLeadIn: !!leadInSegment,
+      openingContinuationWindowMs: OPENING_CONTINUATION_WINDOW_MS,
       metrics: timing.snapshot({ firstMusicReady: true }),
     };
     broadcast(payload);
@@ -1057,9 +1190,24 @@ async function runProgramStartJob(job) {
       musicRequest: job.musicRequest,
       correctionContext: job.correctionContext,
       programArc: stationState.programArc,
+      openingLeadInText: leadInSegment?.text || '',
       djLanguage: job.djLanguage,
       hostMode: job.hostMode,
     });
+    if (remainingPlay.length) {
+      enqueueJob({
+        type: 'music_tail_resolve',
+        key: `tail:${programId}`,
+        priority: 'high',
+        programId,
+        sessionTitle: result.title || '',
+        play: remainingPlay,
+        previousTrack: tracks[tracks.length - 1] || null,
+        previousIndex: tracks.length - 1,
+        djLanguage: job.djLanguage,
+        hostMode: job.hostMode,
+      });
+    }
     enqueueBridgeJobs({ programId, sessionTitle: result.title || '', tracks, startIndex: 0, djLanguage: job.djLanguage, hostMode: job.hostMode });
     return payload;
   }
@@ -1117,6 +1265,7 @@ async function runOpeningGenerationJob(job) {
     musicRequest: job.musicRequest,
     programArc: job.programArc || stationState.programArc,
     correctionContext: job.correctionContext,
+    leadInText: job.openingLeadInText || '',
     djLanguage: job.djLanguage,
     hostMode: job.hostMode,
   });
@@ -1131,16 +1280,25 @@ async function runOpeningGenerationJob(job) {
     timing.mark('write_open_fallback_ms');
   }
 
+  if (isStaleProgramJob(job)) {
+    console.log(`[opening_generation] skip stale opening for ${job.programId}`);
+    return [];
+  }
+
   broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'phase', phase: 'voice_open' });
   const coldOpenResult = {
     ...result,
-    segments: [
-      programStartIdSegment(job.programId),
-      ...coldOpenSegments,
-    ],
+    segments: coldOpenSegments.filter(segment =>
+      !job.openingLeadInText ||
+      String(segment?.text || '').trim() !== String(job.openingLeadInText || '').trim()
+    ),
   };
   const segments = await synthesizeSegments(normalizeSegments(coldOpenResult, tracks, false, job.failedTracks || []));
   timing.mark('voice_open_ms');
+  if (isStaleProgramJob(job)) {
+    console.log(`[opening_generation] skip stale synthesized opening for ${job.programId}`);
+    return [];
+  }
 
   const liveOpeningSegments = segments.map((segment, index) => {
     if (segment.position !== 'before_track' || segment.trackIndex !== 0) return segment;
@@ -1162,14 +1320,74 @@ async function runOpeningGenerationJob(job) {
     segments: liveOpeningSegments,
     reason: coldOpenReason,
     opening: true,
+    openingContinuation: !!job.openingLeadInText,
+    continuationWindowMs: OPENING_CONTINUATION_WINDOW_MS,
     metrics: timing.snapshot(),
   });
   return liveOpeningSegments;
 }
 
+async function runMusicTailResolveJob(job) {
+  const timing = metricTimer('music_tail_resolve');
+  const programId = job.programId || stationState.programId || makeProgramId();
+  if (isStaleProgramJob(job)) {
+    console.log(`[music_tail_resolve] skip stale tail for ${job.programId}`);
+    return { type: 'tracks-ready', programId, tracks: [], failedTracks: [], tail: true, stale: true, metrics: timing.snapshot() };
+  }
+  const startIndex = stationState.tracks.length;
+  const previousTrack = job.previousTrack || stationState.tracks[startIndex - 1] || null;
+  const previousIndex = Number.isInteger(job.previousIndex) ? job.previousIndex : startIndex - 1;
+  const { tracks, failedTracks } = await resolveRequestedTracks(job.play || [], { queue: stationState.tracks });
+  timing.mark('resolve_audio_ms');
+  if (isStaleProgramJob(job)) {
+    console.log(`[music_tail_resolve] skip stale resolved tail for ${job.programId}`);
+    return { type: 'tracks-ready', programId, tracks: [], failedTracks, tail: true, stale: true, metrics: timing.snapshot() };
+  }
+
+  if (!tracks.length) {
+    return { type: 'tracks-ready', programId, tracks: [], failedTracks, tail: true, metrics: timing.snapshot() };
+  }
+
+  stationState.programId = programId;
+  stationState.sessionTitle = job.sessionTitle || stationState.sessionTitle || '';
+  stationState.tracks = [...stationState.tracks, ...tracks];
+  stationState.programArc = extendProgramArc(stationState.programArc, {
+    tracksAdded: tracks.length,
+    reason: 'resolved remaining startup tracks',
+  });
+
+  const payload = {
+    type: 'tracks-ready',
+    programId,
+    tracks,
+    startIndex,
+    failedTracks,
+    reason: 'resolved remaining startup tracks',
+    programArc: stationState.programArc,
+    tail: true,
+    metrics: timing.snapshot(),
+  };
+  broadcast(payload);
+  enqueueBridgeJobs({
+    programId,
+    sessionTitle: stationState.sessionTitle,
+    tracks,
+    startIndex,
+    previousTrack,
+    previousIndex,
+    djLanguage: job.djLanguage,
+    hostMode: job.hostMode,
+  });
+  return payload;
+}
+
 async function runMusicRefillJob(job) {
   const timing = metricTimer('music_refill');
   const programId = job.programId || stationState.programId || makeProgramId();
+  if (isStaleProgramJob(job)) {
+    console.log(`[music_refill] skip stale refill for ${job.programId}`);
+    return { type: 'tracks-ready', programId, tracks: [], failedTracks: [], stale: true, metrics: timing.snapshot() };
+  }
   const queue = normalizeTracksForPrompt(job.queue || stationState.tracks);
   const prompt = buildMusicRefillPrompt({
     programTitle: job.sessionTitle || stationState.sessionTitle,
@@ -1183,6 +1401,10 @@ async function runMusicRefillJob(job) {
   timing.mark('choose_tracks_ms');
   const { tracks, failedTracks } = await resolveRequestedTracks(result.play || [], { queue });
   timing.mark('resolve_audio_ms');
+  if (isStaleProgramJob(job)) {
+    console.log(`[music_refill] skip stale resolved refill for ${job.programId}`);
+    return { type: 'tracks-ready', programId, tracks: [], failedTracks, stale: true, metrics: timing.snapshot() };
+  }
   const startIndex = Number.isInteger(job.queueLength) ? job.queueLength : stationState.tracks.length;
   const previousTrack = job.previousTrack || stationState.tracks[stationState.tracks.length - 1] || null;
   const previousIndex = Number.isInteger(job.previousIndex) ? job.previousIndex : startIndex - 1;
@@ -1224,12 +1446,20 @@ async function runBridgeGenerationJob(job) {
   });
   const result = await callClaude(prompt);
   timing.mark('write_bridge_ms');
+  if (isStaleProgramJob(job)) {
+    console.log(`[bridge_generation] skip stale bridge for ${job.programId}`);
+    return [];
+  }
   let segments = await synthesizeSegments(normalizeSegments(
     result,
     new Array(Math.max(job.beforeTrackIndex + 1, 1)).fill(null),
     false,
     []
   ));
+  if (isStaleProgramJob(job)) {
+    console.log(`[bridge_generation] skip stale synthesized bridge for ${job.programId}`);
+    return [];
+  }
   segments = segments.filter(segment =>
     segment.position === 'between_tracks' &&
     segment.afterTrackIndex === job.afterTrackIndex &&

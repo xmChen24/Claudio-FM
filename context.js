@@ -148,33 +148,69 @@ function buildProgramStartPrompt(userInput, queueState = '', options = {}) {
   return [
     sharedContext(),
     queueState ? `# 当前队列状态\n${queueState}` : '',
-    `# 电台任务\nprogram_start：开播。只生成节目标题、2-3 首歌、以及 cold_open 句级播报。不要生成 bridge、back_announce 或 quick_touch。`,
+    `# 电台任务\nprogram_start：开播选歌。只生成节目标题、2-3 首歌、可选一句 openingLeadIn，以及内部原因。不要生成完整 cold_open、bridge、back_announce 或 quick_touch。`,
     intentDetails ? `# 意图细节\n${intentDetails}` : '',
     arcDetails ? `# 当前节目弧线\n${arcDetails}` : '',
     correctionDetails ? `# 纠错上下文\n${correctionDetails}` : '',
     `# 用户输入 / 启动意图\n${userInput}`,
     [
       'Strictly output JSON only, with no extra text.',
-      djLanguageInstruction(djLanguage, 'cold_open segment text'),
+      djLanguageInstruction(djLanguage, 'openingLeadIn text'),
       hostModeInstruction(hostMode),
       'The "title" should use the same language as the DJ narration.',
-      'Return only: title, play, segments, reason.',
+      'Return only: title, play, openingLeadIn, reason.',
       'The "play" array must contain 2-3 songs in "song title - artist" format. Keep original-language titles/artists for search.',
       'Do not repeat any song from the recent play history or current queue. Do not include the same song twice in one play array.',
       'Avoid artists that appear in the most recent 5 played songs unless the listener explicitly asked for that artist.',
       'Use dynamic DJ memory as taste and tone guidance, but do not mention the memory system.',
       'If correction context is present, recover from the rejected lane and do not choose the rejected current track or artist unless explicitly required.',
-      'The "segments" array must contain only cold_open segments for trackIndex 0.',
-      'Write 3-5 consecutive cold_open segments, each one sentence, same position before_track and trackIndex 0.',
-      coldOpenLengthInstruction(djLanguage),
-      'Use optional part values: anchor, heart, turn, image, invitation.',
-      'The cold open must feel like an on-air host opening a station, not an assistant explaining recommendations.',
-      '{"title":"program moment name","play":["song - artist"],"segments":[{"type":"cold_open","groupId":"open_0","part":"anchor","position":"before_track","trackIndex":0,"text":"One sentence."},{"type":"cold_open","groupId":"open_0","part":"turn","position":"before_track","trackIndex":0,"text":"One sentence."},{"type":"cold_open","groupId":"open_0","part":"invitation","position":"before_track","trackIndex":0,"text":"One short sentence into the music."}],"reason":"internal reason"}',
+      'openingLeadIn is optional and must be exactly one short, natural on-air sentence. It is the first sentence of the later cold open, not a station ID.',
+      'openingLeadIn must not say "This is Claudio", "coming up next", "let me", "okay", or explain that you are generating a program.',
+      'Do not include a "segments" array in this response.',
+      '{"title":"program moment name","play":["song - artist"],"openingLeadIn":"One short, non-template on-air first line.","reason":"internal reason"}',
     ].join('\n'),
   ].filter(Boolean).join('\n\n');
 }
 
-function buildColdOpenForTracksPrompt({ programTitle = '', tracks = [], userInput = '', djLanguage = 'en', hostMode = 'story', userIntent = '', musicRequest = null, programArc = null, correctionContext = null } = {}) {
+function buildOpeningLeadInPrompt({ programTitle = '', firstTrack = null, userInput = '', djLanguage = 'en', hostMode = 'story', userIntent = '', musicRequest = null, programArc = null, correctionContext = null, seed = '' } = {}) {
+  const normalizedLanguage = normalizeDjLanguage(djLanguage);
+  const normalizedHostMode = normalizeHostMode(hostMode);
+  const intentDetails = intentDetailText({ userIntent, musicRequest });
+  const arcDetails = programArcText({ programArc });
+  const correctionDetails = correctionText({ correctionContext });
+  const firstTrackText = firstTrack
+    ? `${firstTrack.title || firstTrack.query}${firstTrack.artist ? ' — ' + firstTrack.artist : ''}`
+    : 'unknown first track';
+
+  return [
+    sharedContext({ includeDialog: true, recentPlayLimit: 10 }),
+    `# 电台任务\nopening_lead_in：为已经确认可播放的第一首歌写 cold open 的第一句。`,
+    programTitle ? `# 当前节目标题\n${programTitle}` : '',
+    intentDetails ? `# 意图细节\n${intentDetails}` : '',
+    arcDetails ? `# 当前节目弧线\n${arcDetails}` : '',
+    correctionDetails ? `# 纠错上下文\n${correctionDetails}` : '',
+    userInput ? `# 用户输入 / 启动意图\n${userInput}` : '',
+    seed ? `# program_start 给出的开场种子\n${seed}` : '',
+    `# 第一首已确认可播放歌曲\n${firstTrackText}`,
+    [
+      'Strictly output JSON only, with no extra text.',
+      'Return only: {"segment":{"type":"cold_open","groupId":"open_0","part":"lead_in","position":"before_track","trackIndex":0,"text":"..."}, "reason":"internal reason"}.',
+      djLanguageInstruction(normalizedLanguage, 'lead-in text'),
+      hostModeInstruction(normalizedHostMode),
+      'Write exactly one sentence.',
+      normalizedLanguage === 'zh'
+        ? 'Keep it 15-36 Chinese characters unless a song title requires more.'
+        : 'Keep it 8-18 English words unless a song title requires more.',
+      'It must feel like a live DJ taking the mic before the first track, not a template, slogan, assistant reply, or station ID.',
+      'It is the first sentence of a longer cold open; leave room for later detail.',
+      'Do not say "This is Claudio", "coming up next", "let me", "okay", "alright", or explain the queue.',
+      'If you mention a song title or artist, it must exactly match the confirmed first track above.',
+      '{"segment":{"type":"cold_open","groupId":"open_0","part":"lead_in","position":"before_track","trackIndex":0,"text":"One short first line."},"reason":"internal reason"}',
+    ].join('\n'),
+  ].filter(Boolean).join('\n\n');
+}
+
+function buildColdOpenForTracksPrompt({ programTitle = '', tracks = [], userInput = '', djLanguage = 'en', hostMode = 'story', userIntent = '', musicRequest = null, programArc = null, correctionContext = null, leadInText = '' } = {}) {
   const normalizedLanguage = normalizeDjLanguage(djLanguage);
   const normalizedHostMode = normalizeHostMode(hostMode);
   const intentDetails = intentDetailText({ userIntent, musicRequest });
@@ -192,6 +228,7 @@ function buildColdOpenForTracksPrompt({ programTitle = '', tracks = [], userInpu
     arcDetails ? `# 当前节目弧线\n${arcDetails}` : '',
     correctionDetails ? `# 纠错上下文\n${correctionDetails}` : '',
     userInput ? `# 用户输入 / 启动意图\n${userInput}` : '',
+    leadInText ? `# 已经播出的 cold open 第一句\n${leadInText}` : '',
     `# 已确认可播放歌曲（必须以此为准）\n${trackText}`,
     [
       'Strictly output JSON only, with no extra text.',
@@ -199,6 +236,9 @@ function buildColdOpenForTracksPrompt({ programTitle = '', tracks = [], userInpu
       djLanguageInstruction(normalizedLanguage, 'cold_open segment text'),
       hostModeInstruction(normalizedHostMode),
       'The opening is for trackIndex 0 and must introduce the first confirmed playable track.',
+      leadInText
+        ? 'Continue after the already-aired first sentence. Do not repeat or paraphrase that sentence.'
+        : 'Start with a concrete first sentence for the confirmed first track.',
       'If you mention a song title or artist, it must exactly be from the confirmed playable song list above.',
       'Do not mention or describe any song that is not in the confirmed playable song list.',
       'The "segments" array must contain only cold_open segments for trackIndex 0.',
@@ -269,4 +309,4 @@ function buildBridgePrompt({ programTitle = '', afterTrack, beforeTrack, afterTr
   ].filter(Boolean).join('\n\n');
 }
 
-module.exports = { buildPrompt, buildProgramStartPrompt, buildColdOpenForTracksPrompt, buildMusicRefillPrompt, buildBridgePrompt };
+module.exports = { buildPrompt, buildProgramStartPrompt, buildOpeningLeadInPrompt, buildColdOpenForTracksPrompt, buildMusicRefillPrompt, buildBridgePrompt };

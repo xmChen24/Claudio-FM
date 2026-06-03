@@ -36,15 +36,21 @@ Core modules:
 6. Speech-only conversation goes through `runRadioSegment` and returns an
    immediate spoken response without adding music.
 
-Program start jobs broadcast confirmed playable tracks as soon as they are ready.
-The opening DJ script and bridge scripts are generated in background jobs after
-music can already begin.
+Program start jobs now prioritize the first playable track. Once the first track
+is confirmed, Claudio generates and synthesizes a short `openingLeadIn` with a
+soft timeout. If that lead-in is ready in time, the browser plays it before the
+first song. If it is not ready in time, the browser keeps the fast-start behavior
+and begins music without waiting for the full opening.
+
+The remaining startup tracks are resolved by `music_tail_resolve` and appended
+with `tracks-ready`. The full opening DJ script and bridge scripts are generated
+in background jobs after the first song path is already moving.
 
 ## Job Queues
 
 There are two queues:
 
-- Foreground queue: `program_start`, `music_refill`.
+- Foreground queue: `program_start`, `music_tail_resolve`, `music_refill`.
 - Background queue: `opening_generation`, `bridge_generation`.
 
 Foreground jobs protect the music supply. Background jobs improve hosting
@@ -53,10 +59,13 @@ without blocking first playback.
 Important WebSocket events:
 
 - `job-status`: phase and failure updates for UI status text.
-- `program-start`: new program, confirmed tracks, program arc, and
-  `openingPending` when music is ready before the DJ opening.
-- `tracks-ready`: refill tracks appended to the existing program.
-- `segment-ready`: DJ opening or bridge segments ready for playback.
+- `program-start`: new program, first confirmed tracks, program arc, optional
+  lead-in segment, and `openingPending` while the long opening is still being
+  written.
+- `tracks-ready`: tail-resolved or refill tracks appended to the existing
+  program.
+- `segment-ready`: DJ opening continuation or bridge segments ready for
+  playback.
 - `system-log`: user-facing fallback or voice-engine notices.
 
 ## Frontend Playback State
@@ -72,8 +81,13 @@ does not reset playback.
 
 DJ voice is serialized through a voice channel:
 
+- When `program-start` includes `openingLeadIn`, the browser queues the tracks
+  but waits for that first DJ sentence to finish before starting the first song.
 - Request-line caller voice blocks immediate DJ interruptions until it finishes.
 - Immediate segments are queued and de-duplicated by segment key.
+- Opening continuation segments are only played near the start of the first
+  track; if they arrive after the continuation window, they are dropped rather
+  than interrupting the body of the song.
 - Bridge segments are delivered at song seams when possible.
 - The front end avoids replaying handled segments when late background jobs
   arrive.
@@ -92,7 +106,9 @@ These `.env` values are the main controls for startup speed and resilience:
 | `SPOTIFY_FAST_START` | `0` | When `1`, Spotify hits skip yt-dlp stream fallback and play through Spotify Web Playback URI. |
 | `TTS_SYNTH_CONCURRENCY` | `3` | Parallel DJ segment TTS synthesis count. |
 | `TTS_SYNTH_RETRIES` | `2` | Retries transient TTS failures. |
-
+| `OPENING_LEAD_IN_LLM_TIMEOUT_MS` | `2200` | Maximum wait for the short lead-in LLM call before falling back. |
+| `OPENING_LEAD_IN_TTS_TIMEOUT_MS` | `4500` | Maximum wait for lead-in TTS before starting without it. |
+| `OPENING_CONTINUATION_WINDOW_MS` | `9000` | Time after first-track start during which long opening continuation may still play. |
 Use `SPOTIFY_FAST_START=1` only when Spotify Web Playback is authenticated and
 the browser player is expected to be ready. The front end waits briefly for the
 Spotify device before falling back to a notice.

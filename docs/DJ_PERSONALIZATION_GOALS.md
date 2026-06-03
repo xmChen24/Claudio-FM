@@ -161,15 +161,19 @@ Acceptance checks:
 
 Status: implemented baseline.
 
-Claudio should start music before slow DJ writing, TTS synthesis, or bridge
-generation blocks the station.
+Claudio should let the DJ speak first when a short lead-in can be generated
+quickly, without letting slow long-form writing, TTS synthesis, or bridge
+generation block the station.
 
 Implemented shape:
 
-- Program start resolves playable tracks first and broadcasts `program-start`
-  with `openingPending` when music is ready before the spoken opening.
-- Cold-open writing and opening TTS run in `opening_generation` after confirmed
-  music is already available.
+- Program start resolves the first playable track first.
+- A short `openingLeadIn` is generated and synthesized with soft timeouts; when
+  it is ready, the browser plays it before the first song.
+- Remaining startup tracks are resolved by `music_tail_resolve` and appended
+  through `tracks-ready`.
+- Full cold-open writing and opening TTS run in `opening_generation` after the
+  first-song path is already moving.
 - Bridge writing and bridge TTS run in `bridge_generation` background jobs.
 - Music refill runs as a foreground job and appends tracks through
   `tracks-ready`.
@@ -180,7 +184,11 @@ Implemented shape:
 
 Acceptance checks:
 
-- First playable tracks can arrive before DJ opening audio.
+- First playable track resolution does not wait for the whole startup set.
+- DJ lead-in plays before music when lead-in LLM and TTS finish inside the
+  configured timeout.
+- If lead-in generation or TTS is too slow, startup falls back to fast music
+  start instead of leaving the station silent.
 - Auto-refill does not release its in-flight flag until `tracks-ready`, failure,
   or a rejected duplicate refill response.
 - Correction recovery and vibe changes do not mix stale queue or segment state

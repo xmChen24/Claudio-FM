@@ -112,11 +112,15 @@ DIRECT_ARTIST_TRACK_COUNT=3
 SPOTIFY_FAST_START=0
 TTS_SYNTH_CONCURRENCY=3
 TTS_SYNTH_RETRIES=2
+OPENING_LEAD_IN_LLM_TIMEOUT_MS=2200
+OPENING_LEAD_IN_TTS_TIMEOUT_MS=4500
+OPENING_CONTINUATION_WINDOW_MS=9000
 ```
 
 Track lookup and TTS synthesis run with small bounded concurrency. Result ordering and queue de-duplication still follow the original requested track order.
 Set `SPOTIFY_FAST_START=1` only when Spotify Web Playback is connected and preferred; Claudio will skip yt-dlp stream fallback for Spotify hits so music can start from the Spotify URI faster.
 Direct artist requests such as `Drake` or `play Drake songs` search Spotify track results and enqueue up to `DIRECT_ARTIST_TRACK_COUNT` tracks whose artist field matches the requested artist. Bare inputs like `HUMBLE` fall through to song-title search when no artist-matching tracks are found.
+At startup, Claudio now prioritizes the first playable track and a short generated opening lead-in. The DJ lead-in plays before the first song when its LLM and TTS work finish within the configured lead-in timeouts; the remaining startup tracks and full cold open continue in background.
 
 Start Claudio:
 
@@ -302,12 +306,16 @@ DIRECT_ARTIST_TRACK_COUNT=3
 SPOTIFY_FAST_START=0
 TTS_SYNTH_CONCURRENCY=3
 TTS_SYNTH_RETRIES=2
+OPENING_LEAD_IN_LLM_TIMEOUT_MS=2200
+OPENING_LEAD_IN_TTS_TIMEOUT_MS=4500
+OPENING_CONTINUATION_WINDOW_MS=9000
 ```
 
 当 Spotify Web Playback 已连接且希望优先用 Spotify URI 播放时，可以设置 `SPOTIFY_FAST_START=1`；这样 Spotify 命中后会跳过 yt-dlp 音频流 fallback，首播会更快。
 
 歌曲解析和 TTS 合成会用小并发执行，但最终结果顺序和队列去重仍按原始请求曲目顺序处理。
 直接歌手点歌，例如 `Drake` 或 `play Drake songs`，会搜索 Spotify track 结果，并加入最多 `DIRECT_ARTIST_TRACK_COUNT` 首 artist 字段匹配该歌手的曲目。对 `HUMBLE` 这种裸输入，如果没有匹配到同名歌手曲目，就会继续按歌名搜索。
+启动时，Claudio 会优先解析第一首可播放歌曲并生成一句短开场。只要 lead-in 的 LLM 和 TTS 在超时参数内完成，DJ 会先说这一句再播放第一首；剩余启动曲目和完整 cold open 会继续在后台生成。
 
 启动 Claudio：
 
