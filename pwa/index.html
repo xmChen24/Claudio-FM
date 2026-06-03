@@ -1295,6 +1295,9 @@ function buildStartMessage() {
 }
 let startingRadio = false;
 let retuningStation = false;
+const AUTO_START_DELAY_MS = 700;
+let autoStartTimer = null;
+let userPlaybackIntentSeen = false;
 let spotifyPlayer = null;
 let spotifyDeviceId = '';
 let spotifyReady = false;
@@ -1379,9 +1382,40 @@ function setStationNotice(message = '', link = null) {
   }
 }
 
+function cancelAutoStart() {
+  if (!autoStartTimer) return;
+  clearTimeout(autoStartTimer);
+  autoStartTimer = null;
+}
+
+function markUserPlaybackIntent() {
+  userPlaybackIntentSeen = true;
+  cancelAutoStart();
+}
+
+function stationHasPlaybackIntent() {
+  return startingRadio || currentProgramId || queue.length || musicIsPlaying();
+}
+
+function scheduleAutoStart(syncPromise = null) {
+  cancelAutoStart();
+  autoStartTimer = setTimeout(async () => {
+    autoStartTimer = null;
+    if (userPlaybackIntentSeen || stationHasPlaybackIntent()) return;
+    try {
+      await (syncPromise || environmentSyncInFlight || syncEnvironment());
+      if (userPlaybackIntentSeen || stationHasPlaybackIntent()) return;
+      await startRadio({ automatic: true });
+    } catch (err) {
+      console.error('[auto-start]', err);
+    }
+  }, AUTO_START_DELAY_MS);
+}
+
 /* ── Clock ────────────────────────────────────────────────────────── */
 updateEnvironmentUi();
-syncEnvironment();
+const initialEnvironmentSync = syncEnvironment();
+scheduleAutoStart(initialEnvironmentSync);
 setInterval(() => updateEnvironmentUi(), 10000);
 setInterval(() => syncEnvironment(), 10 * 60 * 1000);
 
@@ -1767,6 +1801,7 @@ musicAudio.addEventListener('timeupdate', () => {
 });
 
 playBtn.addEventListener('click', async () => {
+  markUserPlaybackIntent();
   if (spotifyActive && spotifyPlayer) {
     spotifyPlayer.togglePlay().catch(console.error);
     return;
@@ -1789,6 +1824,7 @@ playBtn.addEventListener('click', async () => {
 });
 
 prevBtn.addEventListener('click', () => {
+  markUserPlaybackIntent();
   if (spotifyActive && spotifyPlayer) {
     spotifyPlayer.seek(0).catch(console.error);
     return;
@@ -1797,6 +1833,7 @@ prevBtn.addEventListener('click', () => {
 });
 
 nextBtn.addEventListener('click', () => {
+  markUserPlaybackIntent();
   playNext();
 });
 
@@ -2581,7 +2618,13 @@ async function playTrack(track) {
   setStationNotice('');
   musicAudio.src = track.streamUrl;
   setPlaybackVolume((!ttsAudio.paused && !ttsAudio.ended) ? duckedMusicVolume() : baseMusicVolume);
-  musicAudio.play().catch(console.error);
+  musicAudio.play().catch(err => {
+    console.error(err);
+    if (err?.name === 'NotAllowedError') {
+      setStationNotice('Browser blocked autoplay. Tap play once to unlock audio.');
+      setPlaying(false);
+    }
+  });
 }
 
 function playNext() {
@@ -2902,18 +2945,19 @@ function handleWsMessage(msg) {
 connectWS();
 
 /* ── Chat ─────────────────────────────────────────────────────────── */
-async function requestChat(message, { showUserTurn = true } = {}) {
+async function requestChat(message, { showUserTurn = true, autoStart = false } = {}) {
   if (showUserTurn) addUserTurn(message);
   const res = await fetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message, djLanguage, hostMode }),
+    body: JSON.stringify({ message, djLanguage, hostMode, autoStart }),
   });
   if (!res.ok) throw new Error(await res.text());
   return res.json().catch(() => ({}));
 }
 
 async function requestVibeShift(kind) {
+  markUserPlaybackIntent();
   if (startingRadio || retuningStation) return;
   retuningStation = true;
   if (moreLikeBtn) moreLikeBtn.disabled = true;
@@ -2964,7 +3008,8 @@ async function patchCallerIntoStation(text) {
   }
 }
 
-async function startRadio() {
+async function startRadio({ automatic = false } = {}) {
+  if (automatic && userPlaybackIntentSeen) return;
   if (startingRadio || currentProgramId || queue.length || musicIsPlaying()) return;
   startingRadio = true;
   playBtn.disabled = true;
@@ -2973,7 +3018,12 @@ async function startRadio() {
   addSystemLine('Tuning Claudio FM…');
   try {
     await (environmentSyncInFlight || syncEnvironment());
-    const result = await requestChat(buildStartMessage(), { showUserTurn: false });
+    if (automatic && userPlaybackIntentSeen) {
+      playBtn.disabled = false;
+      startingRadio = false;
+      return;
+    }
+    const result = await requestChat(buildStartMessage(), { showUserTurn: false, autoStart: automatic });
     if (!result?.queued) {
       playBtn.disabled = false;
       startingRadio = false;
@@ -2991,6 +3041,7 @@ async function startRadio() {
 async function sendMessage() {
   const text = chatInput.value.trim();
   if (!text) return;
+  markUserPlaybackIntent();
   chatInput.value = '';
   chatInput.style.height = 'auto';
   chatSend.disabled = true;
@@ -3004,6 +3055,7 @@ chatInput.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
 });
 chatInput.addEventListener('input', () => {
+  if (chatInput.value.trim()) markUserPlaybackIntent();
   chatInput.style.height = 'auto';
   chatInput.style.height = Math.min(chatInput.scrollHeight, 84) + 'px';
 });

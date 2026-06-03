@@ -241,6 +241,7 @@ const stationState = {
   tracks: [],
   programArc: null,
   lastMusicIntent: null,
+  lastUserRequestAt: 0,
   lastCorrectionContext: null,
   foregroundJobs: [],
   backgroundJobs: [],
@@ -1032,7 +1033,7 @@ function enqueueJob(job) {
     return false;
   }
   stationState.jobKeys.add(key);
-  const queuedJob = { ...job, key };
+  const queuedJob = { ...job, key, createdAt: Date.now() };
   const backgroundJob = ['bridge_generation', 'opening_generation'].includes(job.type);
   const queue = backgroundJob
     ? stationState.backgroundJobs
@@ -1043,6 +1044,23 @@ function enqueueJob(job) {
   if (backgroundJob) drainBackgroundJobs();
   else drainForegroundJobs();
   return true;
+}
+
+function dropQueuedAutoStartJobs() {
+  const before = stationState.foregroundJobs.length;
+  stationState.foregroundJobs = stationState.foregroundJobs.filter(job => {
+    const keep = !(job.type === 'program_start' && job.source === 'autoStart');
+    if (!keep) stationState.jobKeys.delete(job.key);
+    return keep;
+  });
+  const dropped = before - stationState.foregroundJobs.length;
+  if (dropped) console.log(`[jobs] 丢弃 ${dropped} 个自动开台任务，优先处理用户请求`);
+}
+
+function autoStartInvalidated(job) {
+  return job?.source === 'autoStart'
+    && stationState.lastUserRequestAt
+    && stationState.lastUserRequestAt > (job.createdAt || 0);
 }
 
 async function drainForegroundJobs() {
@@ -1128,6 +1146,10 @@ function enqueueBridgeJobs({ programId, sessionTitle, tracks, startIndex = 0, pr
 }
 
 async function runProgramStartJob(job) {
+  if (autoStartInvalidated(job)) {
+    console.log(`[program_start] 跳过已失效的自动开台任务 ${job.key}`);
+    return null;
+  }
   const timing = metricTimer('program_start');
   const programId = makeProgramId();
   let backupSignal = false;
@@ -1196,20 +1218,29 @@ async function runProgramStartJob(job) {
   }
 
   if (tracks.length) {
-    stationState.programId = programId;
-    stationState.sessionTitle = result.title || '';
-    stationState.tracks = tracks;
-    stationState.programArc = createProgramArc({
+    if (autoStartInvalidated(job)) {
+      console.log(`[program_start] 自动开台结果已被用户请求取代 ${job.key}`);
+      return null;
+    }
+    const programArc = createProgramArc({
       userInput: job.input || 'Open the station.',
       userIntent: job.userIntent,
       title: result.title || '',
       tracks,
       correctionContext: job.correctionContext,
     });
+    timing.mark('first_music_ready_ms');
+    const leadInSegment = await buildOpeningLeadInSegment(job, result, tracks, programArc, timing);
+    if (autoStartInvalidated(job)) {
+      console.log(`[program_start] 自动开台 lead-in 已被用户请求取代 ${job.key}`);
+      return null;
+    }
+    stationState.programId = programId;
+    stationState.sessionTitle = result.title || '';
+    stationState.tracks = tracks;
+    stationState.programArc = programArc;
     stationState.lastCorrectionContext = job.correctionContext || null;
     nowPlaying = { title: tracks[0].title, artist: tracks[0].artist, startedAt: Date.now() };
-    timing.mark('first_music_ready_ms');
-    const leadInSegment = await buildOpeningLeadInSegment(job, result, tracks, stationState.programArc, timing);
     if (leadInSegment?.text) {
       addMessage('claudio', leadInSegment.text);
     }
@@ -1222,7 +1253,7 @@ async function runProgramStartJob(job) {
       sessionTitle: result.title || '',
       stationName: STATION_NAME,
       programName: PROGRAM_NAME,
-      programArc: stationState.programArc,
+      programArc,
       failedTracks,
       reason: result.reason,
       signal: backupSignal ? 'backup' : 'live',
@@ -1245,7 +1276,7 @@ async function runProgramStartJob(job) {
       userIntent: job.userIntent,
       musicRequest: job.musicRequest,
       correctionContext: job.correctionContext,
-      programArc: stationState.programArc,
+      programArc,
       openingLeadInText: leadInSegment?.text || '',
       djLanguage: job.djLanguage,
       hostMode: job.hostMode,
@@ -1614,11 +1645,16 @@ async function handleClaudeRequest(userInput, res, intent = {}, skipHistory = fa
 
 // ── HTTP Routes ──────────────────────────────────────────────────────────────
 app.post('/api/chat', async (req, res) => {
-  const { message, autoRefill, djLanguage, hostMode } = req.body;
+  const { message, autoRefill, autoStart, djLanguage, hostMode } = req.body;
   if (!message) return res.status(400).json({ error: 'message required' });
 
   const intent = route(message);
-  intent.source = autoRefill ? 'autoRefill' : 'user';
+  const requestSource = autoRefill ? 'autoRefill' : autoStart ? 'autoStart' : 'user';
+  if (!autoRefill && !autoStart) {
+    stationState.lastUserRequestAt = Date.now();
+    dropQueuedAutoStartJobs();
+  }
+  intent.source = requestSource;
   intent.djLanguage = normalizeDjLanguage(djLanguage);
   intent.hostMode = normalizeHostMode(hostMode);
   const personalizationSignals = captureUserSignal(message, intent, nowPlaying);
@@ -1658,6 +1694,7 @@ app.post('/api/chat', async (req, res) => {
         key: `program_start:correction:${Date.now()}`,
         input: intent.message,
         source: 'user',
+        priority: 'high',
         userIntent: intent.userIntent,
         djLanguage: intent.djLanguage,
         hostMode: intent.hostMode,
@@ -1669,24 +1706,28 @@ app.post('/api/chat', async (req, res) => {
   }
 
   if (intent.mode !== 'speech-only') {
-    stationState.lastMusicIntent = {
-      message: intent.message,
-      userIntent: intent.userIntent,
-      musicRequest: intent.musicRequest || null,
-      at: Date.now(),
-    };
-    enqueueJob({
+    if (!autoStart) {
+      stationState.lastMusicIntent = {
+        message: intent.message,
+        userIntent: intent.userIntent,
+        musicRequest: intent.musicRequest || null,
+        at: Date.now(),
+      };
+    }
+    const keyPrefix = autoStart ? 'program_start:auto' : 'program_start';
+    const accepted = enqueueJob({
       type: 'program_start',
-      key: `program_start:${Date.now()}`,
+      key: `${keyPrefix}:${Date.now()}`,
       input: intent.message,
-      source: autoRefill ? 'autoRefill' : 'user',
+      source: requestSource,
+      priority: requestSource === 'user' ? 'high' : undefined,
       userIntent: intent.userIntent,
       djLanguage: intent.djLanguage,
       hostMode: intent.hostMode,
       musicRequest: intent.musicRequest || null,
       correctionContext: null,
     });
-    return res.json({ queued: true, jobType: 'program_start' });
+    return res.json({ queued: accepted, jobType: 'program_start', autoStart: !!autoStart });
   }
 
   await handleClaudeRequest(intent.message, res, intent, !!autoRefill);
