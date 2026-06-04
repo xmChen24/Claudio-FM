@@ -2,6 +2,14 @@ const netease = require('./music-netease');
 const spotify = require('./music-spotify');
 const ytDlp = require('./music-yt-dlp');
 
+function fallbackProvider() {
+  return String(process.env.MUSIC_FALLBACK_PROVIDER || 'none').trim().toLowerCase();
+}
+
+function ytDlpFallbackEnabled() {
+  return fallbackProvider() === 'yt-dlp';
+}
+
 async function getStreamUrl(query) {
   const track = await getTrack(query);
   return track?.streamUrl || null;
@@ -18,7 +26,10 @@ async function getTrack(query) {
       return spotifyTrack;
     }
     if (provider === 'spotify') {
-      console.log(`[音乐] Spotify 未找到可播版本，尝试 yt-dlp…`);
+      console.log(ytDlpFallbackEnabled()
+        ? `[音乐] Spotify 未找到可播版本，尝试 yt-dlp…`
+        : `[音乐] Spotify 未找到可播版本，已关闭 yt-dlp fallback`);
+      if (!ytDlpFallbackEnabled()) return null;
     }
   }
 
@@ -32,10 +43,12 @@ async function getTrack(query) {
       console.log(`[音乐] 网易云未找到: "${query}"`);
       return null;
     }
-    console.log(`[音乐] 网易云未找到，尝试 yt-dlp…`);
+    console.log(ytDlpFallbackEnabled()
+      ? `[音乐] 网易云未找到，尝试 yt-dlp…`
+      : `[音乐] 网易云未找到，已关闭 yt-dlp fallback`);
   }
 
-  if (provider !== 'netease') {
+  if (provider !== 'netease' && ytDlpFallbackEnabled()) {
     const ytTrack = await ytDlp.getTrack(query);
     if (ytTrack) {
       console.log(`[音乐] yt-dlp 找到: ${ytTrack.title || query}`);
@@ -43,6 +56,10 @@ async function getTrack(query) {
       console.log(`[音乐] yt-dlp 也未找到: "${query}"`);
     }
     return ytTrack;
+  }
+
+  if (provider !== 'netease') {
+    console.log(`[音乐] 未找到且未启用 yt-dlp fallback: "${query}"`);
   }
 
   return null;

@@ -1,7 +1,13 @@
 const { spawn } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 120000);
 const DEFAULT_PROVIDER = process.env.LLM_PROVIDER || 'deepseek';
+const CODEX_COMMAND = process.env.CODEX_CLI_COMMAND || 'codex';
+const CODEX_MODEL = process.env.CODEX_MODEL || '';
+const CODEX_SCHEMA_PATH = process.env.CODEX_OUTPUT_SCHEMA || path.join(__dirname, 'schemas', 'llm-response.schema.json');
 const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com';
 const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-v4-flash';
 const DEEPSEEK_REASONING_EFFORT = process.env.DEEPSEEK_REASONING_EFFORT || '';
@@ -30,12 +36,7 @@ async function generateJson(prompt, options = {}) {
 
 function providerChain(primary) {
   const configuredFallbacks = splitProviderList(process.env.LLM_FALLBACK_PROVIDERS);
-  const defaults = configuredFallbacks.length
-    ? configuredFallbacks
-    : primary === 'claude_cli'
-      ? []
-      : ['claude_cli'];
-  return [...new Set([primary, ...defaults].filter(Boolean))];
+  return [...new Set([primary, ...configuredFallbacks].filter(Boolean))];
 }
 
 function splitProviderList(value) {
@@ -68,6 +69,7 @@ function callProvider(provider, prompt, options = {}) {
   if (provider === 'deepseek') return callDeepSeek(prompt, options);
   if (provider === 'gemini') return callGemini(prompt, options);
   if (provider === 'claude_cli') return callClaudeCli(prompt, options);
+  if (provider === 'codex_cli') return callCodexCli(prompt, options);
   throw new Error(`Unsupported LLM_PROVIDER: ${provider}`);
 }
 
@@ -185,7 +187,6 @@ function callClaudeCli(prompt, options = {}) {
     proc.stdout.on('data', d => { stdout += d.toString(); });
     proc.stderr.on('data', d => {
       stderr += d.toString();
-      process.stderr.write(d);
     });
 
     proc.on('close', () => {
@@ -202,6 +203,90 @@ function callClaudeCli(prompt, options = {}) {
       clearTimeout(timer);
       console.error('[LLM:claude_cli] 进程错误:', err.message);
       reject(err);
+    });
+  });
+}
+
+function callCodexCli(prompt, options = {}) {
+  const timeoutMs = options.timeoutMs || DEFAULT_TIMEOUT_MS;
+  const startAt = Date.now();
+  const outputPath = path.join(os.tmpdir(), `claudio-codex-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+  const args = [
+    'exec',
+    '--ephemeral',
+    '--sandbox',
+    'read-only',
+    '--output-schema',
+    CODEX_SCHEMA_PATH,
+    '-o',
+    outputPath,
+    '-',
+  ];
+  if (CODEX_MODEL) args.splice(1, 0, '-m', CODEX_MODEL);
+
+  console.log(`[LLM:codex_cli] 调用中，prompt ${prompt.length} 字符，timeout ${Math.round(timeoutMs / 1000)}s…`);
+  return new Promise((resolve, reject) => {
+    const proc = spawn(CODEX_COMMAND, args, {
+      env: { ...process.env },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { fs.unlinkSync(outputPath); } catch {}
+      fn(value);
+    };
+    const timer = setTimeout(() => {
+      proc.kill();
+      const stderrPreview = stderr.trim().slice(-800);
+      console.error(`[LLM:codex_cli] 超时（${Math.round(timeoutMs / 1000)}s），已终止；prompt ${prompt.length} 字符`);
+      if (stderrPreview) console.error(`[LLM:codex_cli] stderr 摘要: ${stderrPreview}`);
+      finish(reject, new Error(`Codex subprocess timed out after ${Math.round(timeoutMs / 1000)}s`));
+    }, timeoutMs);
+
+    proc.stdout.on('data', d => { stdout += d.toString(); });
+    proc.stderr.on('data', d => {
+      stderr += d.toString();
+    });
+    proc.stdin.on('error', err => {
+      if (err.code !== 'EPIPE') console.error('[LLM:codex_cli] stdin error:', err.message);
+    });
+    proc.stdin.end([
+      'Return only JSON that matches the provided output schema.',
+      'Do not modify files, run commands, or ask follow-up questions.',
+      prompt,
+    ].join('\n\n'));
+
+    proc.on('close', code => {
+      if (settled) return;
+      const elapsed = ((Date.now() - startAt) / 1000).toFixed(1);
+      let raw = '';
+      try {
+        raw = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf8').trim() : '';
+      } catch (err) {
+        finish(reject, new Error(`Codex output read failed: ${err.message}`));
+        return;
+      }
+      if (!raw) raw = stdout.trim();
+      if (code !== 0 && !raw) {
+        const stderrPreview = stderr.trim().slice(-1200);
+        finish(reject, new Error(`Codex subprocess exited ${code}${stderrPreview ? `: ${stderrPreview}` : ''}`));
+        return;
+      }
+      const parsed = parseResponse(raw);
+      logParsedResponse('codex_cli', elapsed, parsed, raw);
+      if (!raw) console.warn('[LLM:codex_cli] 警告：返回内容为空');
+      finish(resolve, parsed);
+    });
+
+    proc.on('error', err => {
+      console.error('[LLM:codex_cli] 进程错误:', err.message);
+      finish(reject, err);
     });
   });
 }
@@ -240,4 +325,11 @@ function logParsedResponse(provider, elapsed, parsed, raw) {
   if (!raw) console.warn(`[LLM:${provider}] 警告：返回内容为空`);
 }
 
-module.exports = { generateJson, parseResponse };
+module.exports = {
+  generateJson,
+  parseResponse,
+  _test: {
+    providerChain,
+    splitProviderList,
+  },
+};

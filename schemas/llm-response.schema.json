@@ -1,0 +1,59 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "title": { "type": "string" },
+    "say": { "type": "string" },
+    "play": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "segments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "type": { "type": ["string", "null"] },
+          "groupId": { "type": ["string", "null"] },
+          "part": { "type": ["string", "null"] },
+          "partIndex": { "type": ["integer", "null"] },
+          "partCount": { "type": ["integer", "null"] },
+          "position": { "type": ["string", "null"] },
+          "trackIndex": { "type": ["integer", "null"] },
+          "afterTrackIndex": { "type": ["integer", "null"] },
+          "beforeTrackIndex": { "type": ["integer", "null"] },
+          "text": { "type": "string" }
+        },
+        "required": [
+          "type",
+          "groupId",
+          "part",
+          "partIndex",
+          "partCount",
+          "position",
+          "trackIndex",
+          "afterTrackIndex",
+          "beforeTrackIndex",
+          "text"
+        ]
+      }
+    },
+    "intros": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "trackIndex": { "type": ["integer", "null"] },
+          "text": { "type": "string" }
+        },
+        "required": ["trackIndex", "text"]
+      }
+    },
+    "reason": { "type": "string" },
+    "mode": { "type": "string" }
+  },
+  "required": ["title", "say", "play", "segments", "intros", "reason", "mode"]
+}

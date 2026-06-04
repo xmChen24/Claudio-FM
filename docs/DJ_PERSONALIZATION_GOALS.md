@@ -157,23 +157,22 @@ Acceptance checks:
 - The listener can remove incorrect memory without editing JSON manually.
 - Private memory remains local.
 
-## Goal 8: Faster Hosted Playback
+## Goal 8: Hosted Startup Playback
 
 Status: implemented baseline.
 
-Claudio should let the DJ speak first when a short lead-in can be generated
-quickly, without letting slow long-form writing, TTS synthesis, or bridge
-generation block the station.
+Claudio should preserve the hosted radio opening as a core experience. The
+first song should not start until the full cold open has been written,
+synthesized, and spoken.
 
 Implemented shape:
 
 - Program start resolves the first playable track first.
-- A short `openingLeadIn` is generated and synthesized with soft timeouts; when
-  it is ready, the browser plays it before the first song.
+- Full cold-open writing and opening TTS run inside the foreground
+  `program_start` path before `program-start` is broadcast.
+- The browser plays the complete cold open before starting the first song.
 - Remaining startup tracks are resolved by `music_tail_resolve` and appended
   through `tracks-ready`.
-- Full cold-open writing and opening TTS run in `opening_generation` after the
-  first-song path is already moving.
 - Bridge writing and bridge TTS run in `bridge_generation` background jobs.
 - Music refill runs as a foreground job and appends tracks through
   `tracks-ready`.
@@ -185,15 +184,13 @@ Implemented shape:
 Acceptance checks:
 
 - First playable track resolution does not wait for the whole startup set.
-- DJ lead-in plays before music when lead-in LLM and TTS finish inside the
-  configured timeout.
-- If lead-in generation or TTS is too slow, startup falls back to fast music
-  start instead of leaving the station silent.
+- Full cold open text and TTS are ready before the first song starts.
+- Startup can take longer when cold-open generation or TTS is slow.
 - Auto-refill does not release its in-flight flag until `tracks-ready`, failure,
   or a rejected duplicate refill response.
 - Correction recovery and vibe changes do not mix stale queue or segment state
   from the previous program.
-- `SPOTIFY_FAST_START=1` can skip yt-dlp stream fallback for Spotify URI playback
-  when Web Playback is connected.
+- Spotify URI fast-start is the default path; yt-dlp only runs when
+  `MUSIC_FALLBACK_PROVIDER=yt-dlp` is explicitly configured.
 
 Operational details live in `docs/RADIO_ENGINE.md`.

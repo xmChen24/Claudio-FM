@@ -5,7 +5,7 @@ const { setPref } = require('./state');
 const { currentTimeContext } = require('./env-context');
 
 let broadcastFn = null;
-let triggerFn = null;  // runRadioSegment from server.js
+let triggerFn = null;  // enqueueScheduledProgramStart from server.js
 
 function init(broadcast, trigger) {
   broadcastFn = broadcast;

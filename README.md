@@ -99,28 +99,38 @@ npm run kokoro:start
 
 Then set `TTS_PROVIDER=kokoro` or `CALLER_TTS_PROVIDER=kokoro` in `.env`.
 
-Gemini can be used as an OpenAI-compatible LLM provider by setting `LLM_PROVIDER=gemini` and `GEMINI_API_KEY`. LLM calls retry transient failures such as 503s, then try the comma-separated providers in `LLM_FALLBACK_PROVIDERS`. The default fallback is `claude_cli`, which requires the `claude` command to be installed and authenticated.
+Codex CLI can be used as the local LLM subprocess provider by setting `LLM_PROVIDER=codex_cli`. Claudio runs `codex exec` with a JSON output schema, read-only sandboxing, and a hard timeout. Leave `LLM_FALLBACK_PROVIDERS` empty when wrong fallback content is worse than a visible failure.
+
+Gemini can still be used as an OpenAI-compatible LLM provider by setting `LLM_PROVIDER=gemini` and `GEMINI_API_KEY`.
 
 Useful reliability and latency knobs:
 
 ```bash
-LLM_RETRIES=2
+LLM_PROVIDER=codex_cli
+LLM_FALLBACK_PROVIDERS=
+LLM_RETRIES=0
 LLM_RETRY_DELAY_MS=1200
-LLM_FALLBACK_PROVIDERS=claude_cli
+LLM_TIMEOUT_MS=180000
+CODEX_CLI_COMMAND=codex
+CODEX_OUTPUT_SCHEMA=schemas/llm-response.schema.json
 MUSIC_RESOLVE_CONCURRENCY=3
 DIRECT_ARTIST_TRACK_COUNT=3
-SPOTIFY_FAST_START=0
+MUSIC_FALLBACK_PROVIDER=none
+MUSIC_LOOKUP_CACHE_TTL_MS=900000
+MUSIC_NEGATIVE_CACHE_TTL_MS=120000
+MUSIC_LOOKUP_CACHE_MAX_ENTRIES=200
+SCHEDULER_INTERRUPT_ACTIVE_PROGRAM=0
+SPOTIFY_FAST_START=1
 TTS_SYNTH_CONCURRENCY=3
 TTS_SYNTH_RETRIES=2
-OPENING_LEAD_IN_LLM_TIMEOUT_MS=2200
-OPENING_LEAD_IN_TTS_TIMEOUT_MS=4500
-OPENING_CONTINUATION_WINDOW_MS=9000
 ```
 
 Track lookup and TTS synthesis run with small bounded concurrency. Result ordering and queue de-duplication still follow the original requested track order.
-Set `SPOTIFY_FAST_START=1` only when Spotify Web Playback is connected and preferred; Claudio will skip yt-dlp stream fallback for Spotify hits so music can start from the Spotify URI faster.
-Direct artist requests such as `Drake` or `play Drake songs` search Spotify track results and enqueue up to `DIRECT_ARTIST_TRACK_COUNT` tracks whose artist field matches the requested artist. Bare inputs like `HUMBLE` fall through to song-title search when no artist-matching tracks are found.
-At startup, Claudio now prioritizes the first playable track and a short generated opening lead-in. The DJ lead-in plays before the first song when its LLM and TTS work finish within the configured lead-in timeouts; the remaining startup tracks and full cold open continue in background.
+By default, Claudio uses Spotify Web Playback URI fast-start and does not invoke yt-dlp. Set `MUSIC_FALLBACK_PROVIDER=yt-dlp` and `SPOTIFY_FAST_START=0` only when you explicitly want stream-url fallback.
+Direct artist requests such as `Drake` or `play Drake songs` search Spotify track results and enqueue up to `DIRECT_ARTIST_TRACK_COUNT` tracks whose artist field matches the requested artist. Short CJK unknown requests and uppercase bare track names such as `HUMBLE` try song-title search first, then fall back to artist search.
+Spotify lookup results are cached in memory using `MUSIC_LOOKUP_CACHE_TTL_MS`; misses use the shorter `MUSIC_NEGATIVE_CACHE_TTL_MS`, and the cache is capped by `MUSIC_LOOKUP_CACHE_MAX_ENTRIES`.
+Scheduled shows use the same `program_start` path as listener starts. By default they do not interrupt an active program; set `SCHEDULER_INTERRUPT_ACTIVE_PROGRAM=1` to allow scheduled retunes.
+At startup, Claudio now resolves the first playable track quickly, then waits for the full cold open script and TTS before starting the first song. Remaining startup tracks continue resolving in the background.
 
 Start Claudio:
 
@@ -182,7 +192,7 @@ npm run check
 
 ### Troubleshooting
 
-If the terminal says `LLM unavailable` or shows `503 status code`, the active LLM provider is temporarily failing. Claudio retries the request and then tries `LLM_FALLBACK_PROVIDERS`; configure at least one working fallback if you use Gemini as the primary provider.
+If the terminal says `LLM unavailable` or the UI says Claudio took too long to write the link, the active LLM provider failed or timed out. With `LLM_FALLBACK_PROVIDERS=` Claudio does not substitute another model or backup writer; it shows the failure so the listener can retry.
 
 If you hear a backup-style opening, it means every configured LLM provider failed or returned no usable tracks. Check the lines immediately above it in the terminal for the provider error and whether the fallback provider was attempted.
 
@@ -293,29 +303,39 @@ npm run kokoro:start
 
 然后在 `.env` 中设置 `TTS_PROVIDER=kokoro` 或 `CALLER_TTS_PROVIDER=kokoro`。
 
-Gemini 可作为兼容 OpenAI SDK 的 LLM provider：设置 `LLM_PROVIDER=gemini` 和 `GEMINI_API_KEY` 即可。LLM 调用会重试 503 等临时错误，然后尝试 `LLM_FALLBACK_PROVIDERS` 里用逗号分隔的备用 provider。默认备用是 `claude_cli`，需要本机已安装并登录 `claude` 命令。
+Codex CLI 可以作为本地 LLM 子进程 provider：设置 `LLM_PROVIDER=codex_cli`。Claudio 会用 JSON schema、read-only sandbox 和硬超时调用 `codex exec`。如果错误 fallback 内容比明确失败更糟，保持 `LLM_FALLBACK_PROVIDERS` 为空。
+
+Gemini 仍可作为兼容 OpenAI SDK 的 LLM provider：设置 `LLM_PROVIDER=gemini` 和 `GEMINI_API_KEY` 即可。
 
 常用稳定性和延迟参数：
 
 ```bash
-LLM_RETRIES=2
+LLM_PROVIDER=codex_cli
+LLM_FALLBACK_PROVIDERS=
+LLM_RETRIES=0
 LLM_RETRY_DELAY_MS=1200
-LLM_FALLBACK_PROVIDERS=claude_cli
+LLM_TIMEOUT_MS=180000
+CODEX_CLI_COMMAND=codex
+CODEX_OUTPUT_SCHEMA=schemas/llm-response.schema.json
 MUSIC_RESOLVE_CONCURRENCY=3
 DIRECT_ARTIST_TRACK_COUNT=3
-SPOTIFY_FAST_START=0
+MUSIC_FALLBACK_PROVIDER=none
+MUSIC_LOOKUP_CACHE_TTL_MS=900000
+MUSIC_NEGATIVE_CACHE_TTL_MS=120000
+MUSIC_LOOKUP_CACHE_MAX_ENTRIES=200
+SCHEDULER_INTERRUPT_ACTIVE_PROGRAM=0
+SPOTIFY_FAST_START=1
 TTS_SYNTH_CONCURRENCY=3
 TTS_SYNTH_RETRIES=2
-OPENING_LEAD_IN_LLM_TIMEOUT_MS=2200
-OPENING_LEAD_IN_TTS_TIMEOUT_MS=4500
-OPENING_CONTINUATION_WINDOW_MS=9000
 ```
 
-当 Spotify Web Playback 已连接且希望优先用 Spotify URI 播放时，可以设置 `SPOTIFY_FAST_START=1`；这样 Spotify 命中后会跳过 yt-dlp 音频流 fallback，首播会更快。
+默认情况下，Claudio 使用 Spotify Web Playback URI 快速启动，不调用 yt-dlp。只有明确需要 stream URL fallback 时，才设置 `MUSIC_FALLBACK_PROVIDER=yt-dlp` 并把 `SPOTIFY_FAST_START=0`。
 
 歌曲解析和 TTS 合成会用小并发执行，但最终结果顺序和队列去重仍按原始请求曲目顺序处理。
-直接歌手点歌，例如 `Drake` 或 `play Drake songs`，会搜索 Spotify track 结果，并加入最多 `DIRECT_ARTIST_TRACK_COUNT` 首 artist 字段匹配该歌手的曲目。对 `HUMBLE` 这种裸输入，如果没有匹配到同名歌手曲目，就会继续按歌名搜索。
-启动时，Claudio 会优先解析第一首可播放歌曲并生成一句短开场。只要 lead-in 的 LLM 和 TTS 在超时参数内完成，DJ 会先说这一句再播放第一首；剩余启动曲目和完整 cold open 会继续在后台生成。
+直接歌手点歌，例如 `Drake` 或 `play Drake songs`，会搜索 Spotify track 结果，并加入最多 `DIRECT_ARTIST_TRACK_COUNT` 首 artist 字段匹配该歌手的曲目。短中文未知点歌和 `HUMBLE` 这种全大写裸输入会先按歌名搜索，未命中再尝试歌手搜索。
+Spotify 搜索结果会用 `MUSIC_LOOKUP_CACHE_TTL_MS` 做内存缓存；未命中结果用较短的 `MUSIC_NEGATIVE_CACHE_TTL_MS`，总条数由 `MUSIC_LOOKUP_CACHE_MAX_ENTRIES` 限制。
+定时节目现在和用户开台走同一条 `program_start` 链路。默认不会打断活跃节目；如果需要整点强制换台，可设置 `SCHEDULER_INTERRUPT_ACTIVE_PROGRAM=1`。
+启动时，Claudio 会先快速解析第一首可播放歌曲，然后等待完整 cold open 文案和 TTS 完成，再播放第一首歌；剩余启动曲目继续在后台解析。
 
 启动 Claudio：
 
@@ -348,7 +368,7 @@ npm run check
 
 ### 故障排查
 
-如果终端出现 `LLM unavailable` 或 `503 status code`，说明当前 LLM provider 临时不可用。Claudio 会先重试，再尝试 `LLM_FALLBACK_PROVIDERS`；如果主 provider 使用 Gemini，建议至少配置一个可用备用 provider。
+如果终端出现 `LLM unavailable`，或 UI 提示 Claudio 写文案超时，说明当前 LLM provider 失败或超时。配置 `LLM_FALLBACK_PROVIDERS=` 时，Claudio 不会切换备用模型或备用文案，而是明确提示用户重试。
 
 如果听到备用开场，说明所有已配置 LLM provider 都失败，或没有返回可用曲目。看它前面的终端日志，可以确认具体 provider 错误以及是否已尝试 fallback。
 

@@ -36,15 +36,18 @@ Core modules:
 6. Speech-only conversation goes through `runRadioSegment` and returns an
    immediate spoken response without adding music.
 
-Program start jobs now prioritize the first playable track. Once the first track
-is confirmed, Claudio generates and synthesizes a short `openingLeadIn` with a
-soft timeout. If that lead-in is ready in time, the browser plays it before the
-first song. If it is not ready in time, the browser keeps the fast-start behavior
-and begins music without waiting for the full opening.
+Program start jobs now prioritize the first playable track, then block first
+playback until the full cold open script and TTS are ready. The browser speaks
+the complete cold open before starting the first song.
 
 The remaining startup tracks are resolved by `music_tail_resolve` and appended
-with `tracks-ready`. The full opening DJ script and bridge scripts are generated
-in background jobs after the first song path is already moving.
+with `tracks-ready`. Bridge scripts are generated in background jobs after the
+first song path is already moving.
+
+Scheduled openings and hourly checks use the same `program_start` queue. They
+skip if another `program_start` is active or queued, and by default they do not
+interrupt an already active program. Set `SCHEDULER_INTERRUPT_ACTIVE_PROGRAM=1`
+only when scheduled retunes should be allowed to replace the current show.
 
 ## Job Queues
 
@@ -59,9 +62,9 @@ without blocking first playback.
 Important WebSocket events:
 
 - `job-status`: phase and failure updates for UI status text.
-- `program-start`: new program, first confirmed tracks, program arc, optional
-  lead-in segment, and `openingPending` while the long opening is still being
-  written.
+- `program-start`: new program, first confirmed tracks, program arc, and the
+  complete synthesized cold open segments that should play before the first
+  song.
 - `tracks-ready`: tail-resolved or refill tracks appended to the existing
   program.
 - `segment-ready`: DJ opening continuation or bridge segments ready for
@@ -76,18 +79,23 @@ segments, TTS playback, Spotify state, and refill flags before loading the new
 program. This protects correction recovery and vibe changes from mixing old and
 new shows.
 
+On page load, the browser calls `/api/session` before auto-starting. If the
+server already has a complete `program-start` payload, the browser hydrates that
+payload through the same WebSocket handler so the cold open and first-track
+sequence remain intact. If the server only has an active or queued startup job,
+the browser waits for the later WebSocket events instead of creating a duplicate
+auto-start job.
+
 `tracks-ready` is different: it appends refill tracks to the current program and
 does not reset playback.
 
 DJ voice is serialized through a voice channel:
 
-- When `program-start` includes `openingLeadIn`, the browser queues the tracks
-  but waits for that first DJ sentence to finish before starting the first song.
+- When `program-start` includes `openingReady`, the browser queues the tracks
+  but waits for the complete cold open sequence to finish before starting the
+  first song.
 - Request-line caller voice blocks immediate DJ interruptions until it finishes.
 - Immediate segments are queued and de-duplicated by segment key.
-- Opening continuation segments are only played near the start of the first
-  track; if they arrive after the continuation window, they are dropped rather
-  than interrupting the body of the song.
 - Bridge segments are delivered at song seams when possible.
 - The front end avoids replaying handled segments when late background jobs
   arrive.
@@ -98,20 +106,37 @@ These `.env` values are the main controls for startup speed and resilience:
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `LLM_RETRIES` | `2` | Retries transient LLM failures before falling back. |
+| `LLM_PROVIDER` | `codex_cli` | Active writing engine. `codex_cli` runs `codex exec` as a local subprocess. |
+| `LLM_FALLBACK_PROVIDERS` | empty | Optional comma-separated fallback chain. Leave empty to fail visibly instead of substituting another writer. |
+| `LLM_RETRIES` | `0` | Retries transient LLM failures. Keep `0` with subprocess providers to avoid long repeated waits. |
 | `LLM_RETRY_DELAY_MS` | `1200` | Linear retry delay for LLM failures. |
-| `LLM_FALLBACK_PROVIDERS` | `claude_cli` | Comma-separated provider fallback chain after the primary provider fails. |
+| `LLM_TIMEOUT_MS` | `180000` | Hard timeout for LLM calls, including Codex/Claude subprocess calls. |
+| `CODEX_CLI_COMMAND` | `codex` | Command used by the `codex_cli` provider. |
+| `CODEX_OUTPUT_SCHEMA` | `schemas/llm-response.schema.json` | JSON schema passed to `codex exec --output-schema`. |
 | `MUSIC_RESOLVE_CONCURRENCY` | `3` | Parallel music lookup count. Ordering is preserved after resolution. |
 | `DIRECT_ARTIST_TRACK_COUNT` | `3` | Number of artist-matched tracks for direct artist requests. |
-| `SPOTIFY_FAST_START` | `0` | When `1`, Spotify hits skip yt-dlp stream fallback and play through Spotify Web Playback URI. |
+| `MUSIC_FALLBACK_PROVIDER` | `none` | Optional music fallback. Set to `yt-dlp` only when stream URL fallback is explicitly wanted. |
+| `MUSIC_LOOKUP_CACHE_TTL_MS` | `900000` | In-memory TTL for successful Spotify track and artist lookups. |
+| `MUSIC_NEGATIVE_CACHE_TTL_MS` | `120000` | In-memory TTL for failed Spotify lookups. |
+| `MUSIC_LOOKUP_CACHE_MAX_ENTRIES` | `200` | Maximum in-memory Spotify lookup cache entries. Oldest entries are pruned first. |
+| `SCHEDULER_INTERRUPT_ACTIVE_PROGRAM` | `0` | Set to `1` only if scheduled programs may replace an active show. |
+| `SPOTIFY_FAST_START` | `1` | When enabled, Spotify hits skip stream fallback and play through Spotify Web Playback URI. |
 | `TTS_SYNTH_CONCURRENCY` | `3` | Parallel DJ segment TTS synthesis count. |
 | `TTS_SYNTH_RETRIES` | `2` | Retries transient TTS failures. |
-| `OPENING_LEAD_IN_LLM_TIMEOUT_MS` | `2200` | Maximum wait for the short lead-in LLM call before falling back. |
-| `OPENING_LEAD_IN_TTS_TIMEOUT_MS` | `4500` | Maximum wait for lead-in TTS before starting without it. |
-| `OPENING_CONTINUATION_WINDOW_MS` | `9000` | Time after first-track start during which long opening continuation may still play. |
-Use `SPOTIFY_FAST_START=1` only when Spotify Web Playback is authenticated and
-the browser player is expected to be ready. The front end waits briefly for the
-Spotify device before falling back to a notice.
+By default, Claudio avoids yt-dlp so direct requests do not wait on video search
+or audio extraction. To restore the older stream URL fallback path, set
+`MUSIC_FALLBACK_PROVIDER=yt-dlp` and `SPOTIFY_FAST_START=0`.
+
+Unknown direct requests are resolved conservatively: explicit artist requests
+such as `play Drake songs` still use artist search first. Direct song commands
+such as `播放晴天`, `play Sofia`, quoted CJK titles, short CJK bare inputs, and
+uppercase bare titles such as `HUMBLE` try track search first before falling
+back to artist search. Vibe commands such as `More like this: ... A - B ...`
+are classified before dash-title parsing so they cannot become accidental exact
+track requests.
+
+`npm run check` includes `scripts/test-routing.js`, which covers the bilingual
+request parser and Spotify candidate scoring edge cases.
 
 ## Runtime APIs
 
@@ -123,6 +148,7 @@ Useful local endpoints:
 | `POST /api/radio/refill` | Frontend-triggered music refill. |
 | `GET /api/now` | Current `nowPlaying` snapshot. |
 | `GET /api/program-arc` | Active program arc or inactive state. |
+| `GET /api/session` | Current server-side program, queue, last startup payload, and job status for page-load hydration. |
 | `GET /api/environment` | Local time-zone and locale context. |
 | `POST /api/environment` | Update local time-zone and locale context. |
 | `GET /api/taste` | Static taste file. |

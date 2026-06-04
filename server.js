@@ -7,7 +7,7 @@ const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
 const { route } = require('./router');
-const { buildPrompt, buildProgramStartPrompt, buildOpeningLeadInPrompt, buildColdOpenForTracksPrompt, buildMusicRefillPrompt, buildBridgePrompt } = require('./context');
+const { buildPrompt, buildProgramStartPrompt, buildColdOpenForTracksPrompt, buildMusicRefillPrompt, buildBridgePrompt } = require('./context');
 const { callClaude } = require('./claude');
 const { synthesize } = require('./tts');
 const { getTrack, getArtistTracks } = require('./music');
@@ -132,6 +132,12 @@ function kokoroBaseUrl() {
 }
 
 function userFacingSystemMessage(message = '') {
+  if (/codex subprocess timed out|subprocess timed out|llm.*timed out|all llm providers failed/i.test(message)) {
+    return 'Claudio took too long to write this link. Please try again in a moment.';
+  }
+  if (/codex subprocess exited|llm unavailable|provider .* failed/i.test(message)) {
+    return 'Claudio could not reach the writing engine. Please try again in a moment.';
+  }
   if (/tts not started|kokoro unreachable|voice engine|tts.*unreachable/i.test(message)) {
     return 'Voice engine is offline. Claudio can keep the music moving while voice warms up.';
   }
@@ -146,6 +152,13 @@ function broadcastUserSystemLog(level, message, details = {}) {
     ...details,
     userMessage: details.userMessage || userFacingSystemMessage(message),
   });
+}
+
+function llmUnavailableError(err, phase = 'LLM') {
+  const message = `${phase} unavailable: ${err.message}`;
+  const next = new Error(message);
+  next.cause = err;
+  return next;
 }
 
 function metricTimer(label) {
@@ -214,9 +227,6 @@ const MUSIC_RESOLVE_CONCURRENCY = Math.max(1, Number(process.env.MUSIC_RESOLVE_C
 const TTS_SYNTH_CONCURRENCY = Math.max(1, Number(process.env.TTS_SYNTH_CONCURRENCY || 3));
 const TTS_SYNTH_RETRIES = Math.max(0, Number(process.env.TTS_SYNTH_RETRIES || 2));
 const DIRECT_ARTIST_TRACK_COUNT = Math.max(1, Number(process.env.DIRECT_ARTIST_TRACK_COUNT || 3));
-const OPENING_LEAD_IN_LLM_TIMEOUT_MS = Math.max(500, Number(process.env.OPENING_LEAD_IN_LLM_TIMEOUT_MS || 2200));
-const OPENING_LEAD_IN_TTS_TIMEOUT_MS = Math.max(500, Number(process.env.OPENING_LEAD_IN_TTS_TIMEOUT_MS || 4500));
-const OPENING_CONTINUATION_WINDOW_MS = Math.max(0, Number(process.env.OPENING_CONTINUATION_WINDOW_MS || 9000));
 const FALLBACK_PROGRAM_TRACKS = [
   'Sweet Disposition - The Temper Trap',
   'Ventura Highway - America',
@@ -240,6 +250,7 @@ const stationState = {
   sessionTitle: '',
   tracks: [],
   programArc: null,
+  lastProgramPayload: null,
   lastMusicIntent: null,
   lastUserRequestAt: 0,
   lastCorrectionContext: null,
@@ -247,7 +258,9 @@ const stationState = {
   backgroundJobs: [],
   jobKeys: new Set(),
   foregroundWorkerRunning: false,
+  foregroundActiveJob: null,
   backgroundWorkerRunning: false,
+  backgroundActiveJob: null,
 };
 
 function normalizeDjLanguage(value) {
@@ -411,6 +424,28 @@ function fallbackProgramStartResult(job = {}, reason = '') {
   };
 }
 
+function directMusicFailureResult(job = {}, failedTracks = []) {
+  const djLanguage = normalizeDjLanguage(job.djLanguage);
+  const request = job.musicRequest || {};
+  const target = request.artist || request.title || request.query || job.input || 'that request';
+  const isArtist = request.kind === 'artist';
+  const text = djLanguage === 'zh'
+    ? `我没有找到和「${target}」足够匹配的可播放结果，所以不会用别的歌手来替代。`
+    : `I could not find a playable result that matched "${target}" closely enough, so I will not substitute a different artist.`;
+  return {
+    title: isArtist
+      ? `${target} Request`
+      : 'Direct Music Request',
+    play: [],
+    segments: [{
+      type: 'quick_touch',
+      position: 'immediate',
+      text,
+    }],
+    reason: `direct request not matched: ${failedTracks.join('; ') || target}`,
+  };
+}
+
 function makeSegmentId(index) {
   return `seg_${Date.now()}_${index}`;
 }
@@ -571,19 +606,6 @@ async function synthesizeSegments(segments) {
   return segments;
 }
 
-function extractLeadInText(value) {
-  if (!value) return '';
-  if (typeof value === 'string') return value.trim();
-  if (typeof value.text === 'string') return value.text.trim();
-  if (typeof value.openingLeadIn === 'string') return value.openingLeadIn.trim();
-  if (value.segment) return extractLeadInText(value.segment);
-  if (Array.isArray(value.segments)) {
-    const segment = value.segments.find(item => item?.text);
-    return extractLeadInText(segment);
-  }
-  return '';
-}
-
 function fallbackOpeningLeadIn(firstTrack, djLanguage = 'en') {
   const title = firstTrack?.title || firstTrack?.query || '';
   const artist = firstTrack?.artist || '';
@@ -614,57 +636,6 @@ function hashText(value) {
 
 function isStaleProgramJob(job) {
   return Boolean(job?.programId && stationState.programId && job.programId !== stationState.programId);
-}
-
-async function buildOpeningLeadInSegment(job, result, tracks, programArc, timing) {
-  const firstTrack = tracks[0] || null;
-  if (!firstTrack) return null;
-
-  const prompt = buildOpeningLeadInPrompt({
-    programTitle: result.title || '',
-    firstTrack,
-    userInput: job.input || 'Open the station.',
-    userIntent: job.userIntent,
-    musicRequest: job.musicRequest,
-    programArc,
-    correctionContext: job.correctionContext,
-    djLanguage: job.djLanguage,
-    hostMode: job.hostMode,
-    seed: result.openingLeadIn || '',
-  });
-
-  const leadInResult = await softTimeout(
-    callClaude(prompt),
-    OPENING_LEAD_IN_LLM_TIMEOUT_MS,
-    'opening_lead_in',
-    null
-  );
-  if (leadInResult) timing.mark('lead_in_write_ms');
-
-  const text = extractLeadInText(leadInResult) ||
-    extractLeadInText(result.openingLeadIn) ||
-    fallbackOpeningLeadIn(firstTrack, job.djLanguage);
-  if (!text) return null;
-
-  const segment = normalizeSegment({
-    type: 'cold_open',
-    groupId: 'open_0',
-    part: 'lead_in',
-    partIndex: 0,
-    position: 'before_track',
-    trackIndex: 0,
-    text,
-  }, 0, tracks.length);
-
-  const synthesized = await softTimeout(
-    synthesizeSegments([segment]),
-    OPENING_LEAD_IN_TTS_TIMEOUT_MS,
-    'opening_lead_in_tts',
-    null
-  );
-  if (!synthesized?.[0]?.ttsUrl) return null;
-  timing.mark('lead_in_voice_ms');
-  return synthesized[0];
 }
 
 async function synthesizeWithRetry(text, options = {}) {
@@ -734,7 +705,7 @@ function normalizeTrackText(value) {
   return String(value || '')
     .toLowerCase()
     .normalize('NFKC')
-    .replace(/[這麼們個愛聽與夢風雲臺台裡裏為無後會國樂歡聲當讓開關過還點對萬]/g, char => ({
+    .replace(/[這麼們個愛聽與夢風雲臺台裡裏為無後會國樂歡聲恆當讓開關過還點對萬]/g, char => ({
       '這': '这',
       '麼': '么',
       '們': '们',
@@ -756,6 +727,7 @@ function normalizeTrackText(value) {
       '樂': '乐',
       '歡': '欢',
       '聲': '声',
+      '恆': '恒',
       '當': '当',
       '讓': '让',
       '開': '开',
@@ -810,8 +782,8 @@ function trackMatchesRequest(requested, resolved) {
 function titleMatchScore(requestedTitle, resolvedTitle) {
   if (!requestedTitle || !resolvedTitle) return 0;
   if (requestedTitle === resolvedTitle) return 120;
-  if (resolvedTitle.includes(requestedTitle)) return 100;
-  if (requestedTitle.includes(resolvedTitle) && resolvedTitle.length >= 2) return 85;
+  if (phraseContains(resolvedTitle, requestedTitle)) return 100;
+  if (resolvedTitle.length >= 2 && phraseContains(requestedTitle, resolvedTitle)) return 85;
   const requestedTokens = requestedTitle.split(' ').filter(Boolean);
   const resolvedTokens = resolvedTitle.split(' ').filter(Boolean);
   if (!requestedTokens.length || !resolvedTokens.length) return 0;
@@ -824,6 +796,21 @@ function titleMatchScore(requestedTitle, resolvedTitle) {
 
 function hasCjk(value) {
   return /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(String(value || ''));
+}
+
+function phraseContains(text, phrase) {
+  if (!text || !phrase) return false;
+  if (hasCjk(phrase) || hasCjk(text)) return text.includes(phrase);
+  const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|\\s)${escaped}(\\s|$)`, 'i').test(text);
+}
+
+function shouldTryUnknownAsTrackFirst(request, rawQuery) {
+  const query = String(rawQuery || '').trim();
+  if (request.prefer === 'track') return true;
+  if (request.title) return true;
+  if (hasCjk(query) && query.length <= 18) return true;
+  return /^[A-Z0-9.'’&\-\s]{2,40}$/.test(query) && /[A-Z]/.test(query);
 }
 
 function payloadTrackFromResolved(query, requested, track) {
@@ -967,14 +954,26 @@ async function resolveDirectMusicRequest(request = {}) {
     return { tracks: [], failedTracks, requestType: 'artist' };
   }
 
-  if (request.kind === 'unknown') {
-    const artistTracks = await resolveArtistRequest(rawQuery);
-    if (artistTracks.length) return { tracks: artistTracks, failedTracks, requestType: 'artist' };
-  }
-
   const trackQuery = request.kind === 'track' && request.title && request.artist
     ? `${request.title} - ${request.artist}`
     : rawQuery;
+
+  let triedTrackFirst = false;
+  if (request.kind === 'unknown') {
+    if (shouldTryUnknownAsTrackFirst(request, rawQuery)) {
+      triedTrackFirst = true;
+      const direct = await resolveSingleTrackRequest(trackQuery, request, failedTracks);
+      if (direct.tracks.length) return direct;
+    }
+    const artistTracks = await resolveArtistRequest(rawQuery);
+    if (artistTracks.length) return { tracks: artistTracks, failedTracks, requestType: 'artist' };
+    if (triedTrackFirst) return { tracks: [], failedTracks, requestType: 'track' };
+  }
+
+  return resolveSingleTrackRequest(trackQuery, request, failedTracks);
+}
+
+async function resolveSingleTrackRequest(trackQuery, request, failedTracks) {
   const track = await getTrack(trackQuery);
   if (!track?.streamUrl && !track?.spotifyUri) {
     failedTracks.push(`${trackQuery} (track not found)`);
@@ -982,7 +981,8 @@ async function resolveDirectMusicRequest(request = {}) {
   }
 
   const requested = parseRequestedTrack(trackQuery);
-  if (request.kind === 'track' && !trackMatchesRequest(requested, track)) {
+  const requiresStrictTrackMatch = request.kind === 'track' || request.prefer === 'track' || Boolean(request.title);
+  if (requiresStrictTrackMatch && !trackMatchesRequest(requested, track)) {
     failedTracks.push(`${trackQuery} (resolved mismatch: ${track.title}${track.artist ? ' — ' + track.artist : ''})`);
     console.log(`[点歌] ↷ 跳过错配: 请求 "${trackQuery}"，返回 "${track.title}${track.artist ? ' — ' + track.artist : ''}"`);
     return { tracks: [], failedTracks, requestType: 'track' };
@@ -1068,6 +1068,7 @@ async function drainForegroundJobs() {
   stationState.foregroundWorkerRunning = true;
   while (stationState.foregroundJobs.length) {
     const job = stationState.foregroundJobs.shift();
+    stationState.foregroundActiveJob = job;
     try {
       console.log(`[jobs] 开始 ${job.key}`);
       broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'started' });
@@ -1075,9 +1076,10 @@ async function drainForegroundJobs() {
       console.log(`[jobs] 完成 ${job.key}`);
     } catch (err) {
       console.error(`[jobs] 失败 ${job.key}:`, err.message);
-      broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'failed', error: err.message });
+      broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'failed', error: err.message, userMessage: userFacingSystemMessage(err.message) });
     } finally {
       stationState.jobKeys.delete(job.key);
+      stationState.foregroundActiveJob = null;
     }
   }
   stationState.foregroundWorkerRunning = false;
@@ -1088,6 +1090,7 @@ async function drainBackgroundJobs() {
   stationState.backgroundWorkerRunning = true;
   while (stationState.backgroundJobs.length) {
     const job = stationState.backgroundJobs.shift();
+    stationState.backgroundActiveJob = job;
     try {
       console.log(`[jobs:bg] 开始 ${job.key}`);
       broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'started' });
@@ -1095,9 +1098,10 @@ async function drainBackgroundJobs() {
       console.log(`[jobs:bg] 完成 ${job.key}`);
     } catch (err) {
       console.error(`[jobs:bg] 失败 ${job.key}:`, err.message);
-      broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'failed', error: err.message });
+      broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'failed', error: err.message, userMessage: userFacingSystemMessage(err.message) });
     } finally {
       stationState.jobKeys.delete(job.key);
+      stationState.backgroundActiveJob = null;
     }
   }
   stationState.backgroundWorkerRunning = false;
@@ -1145,6 +1149,59 @@ function enqueueBridgeJobs({ programId, sessionTitle, tracks, startIndex = 0, pr
   }
 }
 
+function enqueueProgramStartJob({
+  input,
+  source = 'user',
+  priority,
+  userIntent,
+  djLanguage = 'en',
+  hostMode = 'story',
+  musicRequest = null,
+  correctionContext = null,
+  keyPrefix = 'program_start',
+}) {
+  return enqueueJob({
+    type: 'program_start',
+    key: `${keyPrefix}:${Date.now()}`,
+    input,
+    source,
+    priority,
+    userIntent,
+    djLanguage: normalizeDjLanguage(djLanguage),
+    hostMode: normalizeHostMode(hostMode),
+    musicRequest,
+    correctionContext,
+  });
+}
+
+function schedulerMayInterruptActiveProgram() {
+  const value = process.env.SCHEDULER_INTERRUPT_ACTIVE_PROGRAM;
+  return value === '1' || String(value || '').toLowerCase() === 'true';
+}
+
+async function enqueueScheduledProgramStart(userInput, intent = {}) {
+  const activeProgramJob = stationState.foregroundActiveJob?.type === 'program_start' ||
+    stationState.foregroundJobs.some(job => job.type === 'program_start');
+  if (activeProgramJob) {
+    console.log('[scheduler] skip: program_start already active or queued');
+    return { queued: false, skipped: 'program_start_busy' };
+  }
+  if (stationState.programId && stationState.tracks.length && !schedulerMayInterruptActiveProgram()) {
+    console.log('[scheduler] skip: active program is already on air');
+    return { queued: false, skipped: 'active_program' };
+  }
+  const accepted = enqueueProgramStartJob({
+    input: userInput,
+    source: 'scheduler',
+    keyPrefix: 'program_start:scheduler',
+    userIntent: intent.userIntent || 'scheduled_program',
+    djLanguage: intent.djLanguage,
+    hostMode: intent.hostMode,
+    musicRequest: intent.musicRequest || null,
+  });
+  return { queued: accepted, jobType: 'program_start', source: 'scheduler' };
+}
+
 async function runProgramStartJob(job) {
   if (autoStartInvalidated(job)) {
     console.log(`[program_start] 跳过已失效的自动开台任务 ${job.key}`);
@@ -1157,6 +1214,7 @@ async function runProgramStartJob(job) {
   let tracks = [];
   let failedTracks = [];
   let remainingPlay = [];
+  let directRequestFailed = false;
   if (job.musicRequest) {
     broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'phase', phase: 'resolve_audio' });
     const direct = await resolveDirectMusicRequest(job.musicRequest);
@@ -1172,10 +1230,13 @@ async function runProgramStartJob(job) {
         segments: [],
         reason: `direct ${direct.requestType} request`,
       };
+    } else {
+      directRequestFailed = true;
+      result = directMusicFailureResult(job, failedTracks);
     }
   }
 
-  if (!tracks.length) {
+  if (!tracks.length && !directRequestFailed) {
     broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'phase', phase: 'choose_tracks' });
     const prompt = buildProgramStartPrompt(job.input || 'Open the station.', job.queueState || '', {
       userIntent: job.userIntent,
@@ -1189,11 +1250,10 @@ async function runProgramStartJob(job) {
       result = await callClaude(prompt);
       timing.mark('choose_tracks_ms');
     } catch (err) {
-      console.warn(`[program_start] LLM unavailable, using fallback set: ${err.message}`);
-      broadcastUserSystemLog('warn', 'Starting fallback radio signal', { error: err.message });
-      result = fallbackProgramStartResult(job, err.message);
-      backupSignal = true;
+      console.warn(`[program_start] LLM unavailable: ${err.message}`);
+      broadcastUserSystemLog('error', `LLM unavailable: ${err.message}`, { error: err.message });
       timing.mark('choose_tracks_fallback_ms');
+      throw llmUnavailableError(err, 'Program start');
     }
 
     broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'phase', phase: 'resolve_audio' });
@@ -1203,7 +1263,7 @@ async function runProgramStartJob(job) {
     remainingPlay = resolved.remainingPlay;
     timing.mark('resolve_audio_ms');
   }
-  if (!tracks.length) {
+  if (!tracks.length && !directRequestFailed) {
     console.warn('[program_start] No playable tracks from generated set; using fallback set.');
     const fallbackResult = fallbackProgramStartResult(job, 'no playable generated tracks');
     const fallbackResolved = await resolveFirstPlayableTrack(fallbackResult.play, { enforceAvoidance: false });
@@ -1230,9 +1290,16 @@ async function runProgramStartJob(job) {
       correctionContext: job.correctionContext,
     });
     timing.mark('first_music_ready_ms');
-    const leadInSegment = await buildOpeningLeadInSegment(job, result, tracks, programArc, timing);
+    const opening = await generateColdOpenSegments({
+      job,
+      result,
+      tracks,
+      failedTracks,
+      programArc,
+      timing,
+    });
     if (autoStartInvalidated(job)) {
-      console.log(`[program_start] 自动开台 lead-in 已被用户请求取代 ${job.key}`);
+      console.log(`[program_start] 自动开台 cold open 已被用户请求取代 ${job.key}`);
       return null;
     }
     stationState.programId = programId;
@@ -1241,46 +1308,28 @@ async function runProgramStartJob(job) {
     stationState.programArc = programArc;
     stationState.lastCorrectionContext = job.correctionContext || null;
     nowPlaying = { title: tracks[0].title, artist: tracks[0].artist, startedAt: Date.now() };
-    if (leadInSegment?.text) {
-      addMessage('claudio', leadInSegment.text);
+    if (opening.segments.some(segment => segment.text)) {
+      addMessage('claudio', opening.segments.filter(segment => segment.text).map(segment => segment.text).join('\n\n'));
     }
 
     const payload = {
       type: 'program-start',
       programId,
       tracks,
-      segments: leadInSegment ? [leadInSegment] : [],
+      segments: opening.segments,
       sessionTitle: result.title || '',
       stationName: STATION_NAME,
       programName: PROGRAM_NAME,
       programArc,
       failedTracks,
-      reason: result.reason,
+      reason: opening.reason || result.reason,
       signal: backupSignal ? 'backup' : 'live',
-      openingPending: true,
-      openingLeadIn: !!leadInSegment,
-      openingContinuationWindowMs: OPENING_CONTINUATION_WINDOW_MS,
+      openingReady: true,
       metrics: timing.snapshot({ firstMusicReady: true }),
     };
+    stationState.lastProgramPayload = payload;
     broadcast(payload);
 
-    enqueueJob({
-      type: 'opening_generation',
-      key: `opening:${programId}`,
-      priority: 'high',
-      programId,
-      result,
-      tracks,
-      failedTracks,
-      input: job.input,
-      userIntent: job.userIntent,
-      musicRequest: job.musicRequest,
-      correctionContext: job.correctionContext,
-      programArc,
-      openingLeadInText: leadInSegment?.text || '',
-      djLanguage: job.djLanguage,
-      hostMode: job.hostMode,
-    });
     if (remainingPlay.length) {
       enqueueJob({
         type: 'music_tail_resolve',
@@ -1331,15 +1380,13 @@ async function runProgramStartJob(job) {
     signal: backupSignal ? 'backup' : 'live',
     metrics: timing.snapshot({ firstMusicReady: false }),
   };
+  stationState.lastProgramPayload = payload;
   broadcast(payload);
 
   return payload;
 }
 
-async function runOpeningGenerationJob(job) {
-  const timing = metricTimer('opening_generation');
-  const result = job.result || {};
-  const tracks = Array.isArray(job.tracks) ? job.tracks : [];
+async function generateColdOpenSegments({ job, result = {}, tracks = [], failedTracks = [], programArc = null, timing }) {
   let coldOpenSegments = (result.segments || []).filter(segment => segment?.type === 'cold_open');
   let coldOpenReason = result.reason;
 
@@ -1350,9 +1397,9 @@ async function runOpeningGenerationJob(job) {
     userInput: job.input || 'Open the station.',
     userIntent: job.userIntent,
     musicRequest: job.musicRequest,
-    programArc: job.programArc || stationState.programArc,
+    programArc: programArc || job.programArc || stationState.programArc,
     correctionContext: job.correctionContext,
-    leadInText: job.openingLeadInText || '',
+    leadInText: '',
     djLanguage: job.djLanguage,
     hostMode: job.hostMode,
   });
@@ -1362,32 +1409,52 @@ async function runOpeningGenerationJob(job) {
     coldOpenReason = coldOpenScript.reason || coldOpenReason;
     timing.mark('write_open_ms');
   } catch (err) {
-    console.warn(`[opening_generation] Cold open LLM unavailable, using existing intro: ${err.message}`);
-    coldOpenReason = coldOpenReason || `cold open fallback: ${err.message}`;
+    console.warn(`[${job.type}] Cold open LLM unavailable: ${err.message}`);
+    broadcastUserSystemLog('error', `LLM unavailable: ${err.message}`, { error: err.message });
     timing.mark('write_open_fallback_ms');
+    throw llmUnavailableError(err, 'Cold open');
   }
+
+  if (!coldOpenSegments.length && tracks[0]) {
+    coldOpenSegments = [{
+      type: 'cold_open',
+      groupId: 'open_0',
+      part: 'fallback',
+      position: 'before_track',
+      trackIndex: 0,
+      text: fallbackOpeningLeadIn(tracks[0], job.djLanguage),
+    }];
+  }
+
+  broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'phase', phase: 'voice_open' });
+  const coldOpenResult = {
+    ...result,
+    segments: coldOpenSegments,
+  };
+  const segments = await synthesizeSegments(normalizeSegments(coldOpenResult, tracks, false, failedTracks));
+  timing.mark('voice_open_ms');
+  return { segments, reason: coldOpenReason };
+}
+
+async function runOpeningGenerationJob(job) {
+  const timing = metricTimer('opening_generation');
+  const result = job.result || {};
+  const tracks = Array.isArray(job.tracks) ? job.tracks : [];
+  const opening = await generateColdOpenSegments({
+    job,
+    result,
+    tracks,
+    failedTracks: job.failedTracks || [],
+    programArc: job.programArc || stationState.programArc,
+    timing,
+  });
 
   if (isStaleProgramJob(job)) {
     console.log(`[opening_generation] skip stale opening for ${job.programId}`);
     return [];
   }
 
-  broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'phase', phase: 'voice_open' });
-  const coldOpenResult = {
-    ...result,
-    segments: coldOpenSegments.filter(segment =>
-      !job.openingLeadInText ||
-      String(segment?.text || '').trim() !== String(job.openingLeadInText || '').trim()
-    ),
-  };
-  const segments = await synthesizeSegments(normalizeSegments(coldOpenResult, tracks, false, job.failedTracks || []));
-  timing.mark('voice_open_ms');
-  if (isStaleProgramJob(job)) {
-    console.log(`[opening_generation] skip stale synthesized opening for ${job.programId}`);
-    return [];
-  }
-
-  const liveOpeningSegments = segments.map((segment, index) => {
+  const liveOpeningSegments = opening.segments.map((segment, index) => {
     if (segment.position !== 'before_track' || segment.trackIndex !== 0) return segment;
     const { trackIndex, ...rest } = segment;
     return {
@@ -1405,10 +1472,8 @@ async function runOpeningGenerationJob(job) {
     type: 'segment-ready',
     programId: job.programId || stationState.programId,
     segments: liveOpeningSegments,
-    reason: coldOpenReason,
+    reason: opening.reason,
     opening: true,
-    openingContinuation: !!job.openingLeadInText,
-    continuationWindowMs: OPENING_CONTINUATION_WINDOW_MS,
     metrics: timing.snapshot(),
   });
   return liveOpeningSegments;
@@ -1492,9 +1557,9 @@ async function runMusicRefillJob(job) {
     console.log(`[music_refill] skip stale resolved refill for ${job.programId}`);
     return { type: 'tracks-ready', programId, tracks: [], failedTracks, stale: true, metrics: timing.snapshot() };
   }
-  const startIndex = Number.isInteger(job.queueLength) ? job.queueLength : stationState.tracks.length;
-  const previousTrack = job.previousTrack || stationState.tracks[stationState.tracks.length - 1] || null;
-  const previousIndex = Number.isInteger(job.previousIndex) ? job.previousIndex : startIndex - 1;
+  const startIndex = stationState.tracks.length;
+  const previousTrack = stationState.tracks[startIndex - 1] || job.previousTrack || null;
+  const previousIndex = startIndex - 1;
 
   stationState.programId = programId;
   stationState.sessionTitle = job.sessionTitle || stationState.sessionTitle || result.title || '';
@@ -1689,12 +1754,11 @@ app.post('/api/chat', async (req, res) => {
     const canRecover = correctionContext.target || correctionContext.rejectedTrack || correctionContext.lastMusicIntent;
     if (canRecover) {
       stationState.lastCorrectionContext = correctionContext;
-      const accepted = enqueueJob({
-        type: 'program_start',
-        key: `program_start:correction:${Date.now()}`,
+      const accepted = enqueueProgramStartJob({
         input: intent.message,
         source: 'user',
         priority: 'high',
+        keyPrefix: 'program_start:correction',
         userIntent: intent.userIntent,
         djLanguage: intent.djLanguage,
         hostMode: intent.hostMode,
@@ -1715,12 +1779,11 @@ app.post('/api/chat', async (req, res) => {
       };
     }
     const keyPrefix = autoStart ? 'program_start:auto' : 'program_start';
-    const accepted = enqueueJob({
-      type: 'program_start',
-      key: `${keyPrefix}:${Date.now()}`,
+    const accepted = enqueueProgramStartJob({
       input: intent.message,
       source: requestSource,
       priority: requestSource === 'user' ? 'high' : undefined,
+      keyPrefix,
       userIntent: intent.userIntent,
       djLanguage: intent.djLanguage,
       hostMode: intent.hostMode,
@@ -1771,6 +1834,34 @@ app.get('/api/now', (req, res) => {
 
 app.get('/api/program-arc', (req, res) => {
   res.json(stationState.programArc || { active: false });
+});
+
+app.get('/api/session', (req, res) => {
+  const activeJob = stationState.foregroundActiveJob || null;
+  const queuedProgramStart = stationState.foregroundJobs.some(job => job.type === 'program_start');
+  const lastProgramPayload = stationState.lastProgramPayload
+    ? {
+        ...stationState.lastProgramPayload,
+        tracks: stationState.tracks,
+        programArc: stationState.programArc,
+        sessionTitle: stationState.sessionTitle || stationState.lastProgramPayload.sessionTitle || '',
+      }
+    : null;
+  res.json({
+    active: Boolean(stationState.programId || activeJob || queuedProgramStart),
+    programId: stationState.programId,
+    sessionTitle: stationState.sessionTitle,
+    tracks: stationState.tracks,
+    nowPlaying,
+    programArc: stationState.programArc,
+    lastProgramPayload,
+    jobs: {
+      foregroundActive: activeJob ? { type: activeJob.type, key: activeJob.key, source: activeJob.source || null } : null,
+      queuedProgramStart,
+      foregroundQueued: stationState.foregroundJobs.length,
+      backgroundQueued: stationState.backgroundJobs.length,
+    },
+  });
 });
 
 app.get('/api/environment', async (req, res) => {
@@ -1932,7 +2023,7 @@ function cryptoRandomState() {
 }
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
-scheduler.init(broadcast, runRadioSegment);
+scheduler.init(broadcast, enqueueScheduledProgramStart);
 
 server.listen(PORT, HOST, () => {
   console.log(`\n[电台] Claudio FM 启动 → http://${HOST}:${PORT}`);

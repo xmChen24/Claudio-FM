@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node scripts/start.js",
     "start:server": "node server.js",
-    "check": "for f in *.js scripts/*.js; do node --check \"$f\"; done",
+    "check": "for f in *.js scripts/*.js; do node --check \"$f\"; done && node scripts/test-routing.js && node scripts/test-radio-contracts.js",
     "kokoro:start": "node scripts/kokoro-api.js",
     "netease:check": "node scripts/netease-status.js",
     "netease:login": "node scripts/netease-login.js"

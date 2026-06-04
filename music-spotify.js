@@ -3,8 +3,94 @@ const ytDlp = require('./music-yt-dlp');
 const TOKEN_URL = 'https://accounts.spotify.com/api/token';
 const API_BASE = 'https://api.spotify.com/v1';
 const DEFAULT_TIMEOUT_MS = 10000;
+const DEFAULT_CACHE_TTL_MS = 15 * 60 * 1000;
+const DEFAULT_NEGATIVE_CACHE_TTL_MS = 2 * 60 * 1000;
+const DEFAULT_CACHE_MAX_ENTRIES = 200;
 
 let cachedToken = null;
+const lookupCache = new Map();
+
+function envFlag(name, defaultEnabled = false) {
+  const value = process.env[name];
+  if (value === undefined || value === '') return defaultEnabled;
+  return value === '1' || value.toLowerCase() === 'true';
+}
+
+function cacheTtlMs() {
+  return Math.max(0, Number(process.env.MUSIC_LOOKUP_CACHE_TTL_MS || DEFAULT_CACHE_TTL_MS));
+}
+
+function negativeCacheTtlMs() {
+  return Math.max(0, Number(process.env.MUSIC_NEGATIVE_CACHE_TTL_MS || DEFAULT_NEGATIVE_CACHE_TTL_MS));
+}
+
+function cacheMaxEntries() {
+  return Math.max(0, Number(process.env.MUSIC_LOOKUP_CACHE_MAX_ENTRIES || DEFAULT_CACHE_MAX_ENTRIES));
+}
+
+function cloneCacheValue(value) {
+  if (value === null || value === undefined) return value;
+  return JSON.parse(JSON.stringify(value));
+}
+
+function pruneLookupCache(now = Date.now()) {
+  for (const [key, entry] of lookupCache.entries()) {
+    if (!entry || entry.expiresAt <= now) lookupCache.delete(key);
+  }
+  const maxEntries = cacheMaxEntries();
+  if (!maxEntries) {
+    lookupCache.clear();
+    return;
+  }
+  while (lookupCache.size > maxEntries) {
+    const oldestKey = lookupCache.keys().next().value;
+    if (!oldestKey) break;
+    lookupCache.delete(oldestKey);
+  }
+}
+
+function setCacheEntry(key, entry) {
+  lookupCache.delete(key);
+  lookupCache.set(key, entry);
+  pruneLookupCache();
+}
+
+async function cachedLookup(key, resolver) {
+  const now = Date.now();
+  pruneLookupCache(now);
+  const hit = lookupCache.get(key);
+  if (hit && hit.expiresAt > now) {
+    lookupCache.delete(key);
+    lookupCache.set(key, hit);
+    if (hit.promise) return cloneCacheValue(await hit.promise);
+    console.log(`[spotify-cache] hit ${key}`);
+    return cloneCacheValue(hit.value);
+  }
+
+  const promise = Promise.resolve().then(resolver);
+  setCacheEntry(key, { promise, expiresAt: now + cacheTtlMs() });
+  try {
+    const value = await promise;
+    const ttl = value ? cacheTtlMs() : negativeCacheTtlMs();
+    if (ttl > 0) {
+      setCacheEntry(key, { value: cloneCacheValue(value), expiresAt: Date.now() + ttl });
+    } else {
+      lookupCache.delete(key);
+    }
+    return cloneCacheValue(value);
+  } catch (err) {
+    lookupCache.delete(key);
+    throw err;
+  }
+}
+
+function fallbackProvider() {
+  return String(process.env.MUSIC_FALLBACK_PROVIDER || 'none').trim().toLowerCase();
+}
+
+function spotifyFastStartEnabled() {
+  return envFlag('SPOTIFY_FAST_START', true);
+}
 
 function splitQuery(query) {
   const parts = String(query || '').split(/\s+-\s+/);
@@ -18,7 +104,7 @@ function normalizeSearchText(value) {
   return String(value || '')
     .toLowerCase()
     .normalize('NFKC')
-    .replace(/[這麼們個愛聽與夢風雲臺台裡裏為無後會國樂歡聲當讓開關過還點對萬]/g, char => ({
+    .replace(/[這麼們個愛聽與夢風雲臺台裡裏為無後會國樂歡聲恆當讓開關過還點對萬]/g, char => ({
       '這': '这',
       '麼': '么',
       '們': '们',
@@ -40,6 +126,7 @@ function normalizeSearchText(value) {
       '樂': '乐',
       '歡': '欢',
       '聲': '声',
+      '恆': '恒',
       '當': '当',
       '讓': '让',
       '開': '开',
@@ -156,8 +243,13 @@ function normalizeTrack(raw, query) {
 }
 
 async function searchSpotify(query) {
-  const { title, artist } = splitQuery(query);
   const market = process.env.SPOTIFY_MARKET || 'US';
+  const cacheKey = `search:${market}:${normalizeSearchText(query)}`;
+  return cachedLookup(cacheKey, () => searchSpotifyUncached(query, market));
+}
+
+async function searchSpotifyUncached(query, market) {
+  const { title, artist } = splitQuery(query);
   const searches = [];
 
   if (title && artist) searches.push(`track:${title} artist:${artist}`);
@@ -208,8 +300,8 @@ function chooseBestTrack(items, request) {
 function titleMatchScore(requestedTitle, title) {
   if (!requestedTitle || !title) return 0;
   if (title === requestedTitle) return 120;
-  if (title.includes(requestedTitle)) return 95;
-  if (requestedTitle.includes(title) && title.length >= 2) return 80;
+  if (phraseContains(title, requestedTitle)) return 95;
+  if (title.length >= 2 && phraseContains(requestedTitle, title)) return 80;
   const requestedTokens = requestedTitle.split(' ').filter(Boolean);
   const titleTokens = title.split(' ').filter(Boolean);
   if (!requestedTokens.length || !titleTokens.length) return 0;
@@ -218,6 +310,17 @@ function titleMatchScore(requestedTitle, title) {
   if (ratio >= 0.8) return 70;
   if (ratio >= 0.5) return 45;
   return 0;
+}
+
+function phraseContains(text, phrase) {
+  if (!text || !phrase) return false;
+  if (hasCjk(phrase) || hasCjk(text)) return text.includes(phrase);
+  const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|\\s)${escaped}(\\s|$)`, 'i').test(text);
+}
+
+function hasCjk(value) {
+  return /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(String(value || ''));
 }
 
 function artistMatchScore(requestedArtist, artists) {
@@ -229,8 +332,21 @@ function artistMatchScore(requestedArtist, artists) {
 }
 
 async function getArtistTracks(query, count = 3) {
+  const market = process.env.SPOTIFY_MARKET || 'US';
+  const cacheKey = [
+    'artist',
+    market,
+    count,
+    fallbackProvider(),
+    spotifyFastStartEnabled() ? 'fast' : 'stream',
+    envFlag('SPOTIFY_ALLOW_PREVIEW') ? 'preview' : 'no-preview',
+    normalizeSearchText(query),
+  ].join(':');
+  return cachedLookup(cacheKey, () => getArtistTracksUncached(query, count, market));
+}
+
+async function getArtistTracksUncached(query, count, market) {
   try {
-    const market = process.env.SPOTIFY_MARKET || 'US';
     const artistName = String(query || '').trim();
     const normalizedArtist = normalizeSearchText(artistName);
     if (!normalizedArtist) return [];
@@ -268,19 +384,18 @@ async function getArtistTracks(query, count = 3) {
 }
 
 async function resolveStreamUrl(track) {
-  const fallbackProvider = process.env.MUSIC_FALLBACK_PROVIDER || 'yt-dlp';
-
-  if (process.env.SPOTIFY_FAST_START === '1' && track.spotifyUri) {
+  const provider = fallbackProvider();
+  if (spotifyFastStartEnabled() && track.spotifyUri) {
     return null;
   }
 
-  if (fallbackProvider === 'yt-dlp') {
+  if (provider === 'yt-dlp') {
     const lookup = `${track.title}${track.artist ? ' - ' + track.artist : ''}`;
     const streamUrl = await ytDlp.getStreamUrl(lookup);
     if (streamUrl) return streamUrl;
   }
 
-  if (process.env.SPOTIFY_ALLOW_PREVIEW === '1' && track.previewUrl) {
+  if (envFlag('SPOTIFY_ALLOW_PREVIEW') && track.previewUrl) {
     return track.previewUrl;
   }
 
@@ -288,13 +403,26 @@ async function resolveStreamUrl(track) {
 }
 
 async function getTrack(query) {
+  const market = process.env.SPOTIFY_MARKET || 'US';
+  const cacheKey = [
+    'track',
+    market,
+    fallbackProvider(),
+    spotifyFastStartEnabled() ? 'fast' : 'stream',
+    envFlag('SPOTIFY_ALLOW_PREVIEW') ? 'preview' : 'no-preview',
+    normalizeSearchText(query),
+  ].join(':');
+  return cachedLookup(cacheKey, () => getTrackUncached(query));
+}
+
+async function getTrackUncached(query) {
   try {
     const track = await searchSpotify(query);
     if (!track) return null;
 
     const streamUrl = await resolveStreamUrl(track);
     if (!streamUrl) {
-      console.warn(`[spotify] no fallback stream; using Spotify Web Playback URI: ${track.title} - ${track.artist || 'unknown'}`);
+      console.log(`[spotify] using Web Playback URI: ${track.title} - ${track.artist || 'unknown'}`);
     }
 
     return {
@@ -313,4 +441,11 @@ module.exports = {
   getTrack,
   getArtistTracks,
   searchSpotify,
+  _test: {
+    chooseBestTrack,
+    normalizeSearchText,
+    cacheMaxEntries,
+    pruneLookupCache,
+    lookupCache,
+  },
 };

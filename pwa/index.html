@@ -359,12 +359,18 @@ html, body {
 .header-time {
   font-family: Doto, "IBM Plex Mono", monospace;
   font-size: 64px; font-weight: 600; font-variant-numeric: tabular-nums;
-  color: rgb(255,207,95);
+  color: rgb(255,255,255);
   line-height: .78;
   letter-spacing: 0;
   text-shadow:
-    rgba(255,207,95,.74) 0 0 10px,
+    rgba(255,255,255,.72) 0 0 10px,
     rgba(255,92,188,.68) 2px 2px 0;
+}
+.header-time .time-separator {
+  display: inline-block;
+  font-size: .72em;
+  transform: translateY(-.06em);
+  margin: 0 .02em;
 }
 .header-context {
   position: absolute; z-index: 2;
@@ -376,14 +382,14 @@ html, body {
 }
 .header-date {
   font-family: Doto, "IBM Plex Mono", monospace;
-  font-size: 13px; font-weight: 700; line-height: 1;
+  font-size: 17px; font-weight: 700; line-height: 1;
   letter-spacing: .02em;
   color: rgb(255,255,255);
   max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .header-calendar {
   font-family: Doto, "IBM Plex Mono", monospace;
-  font-size: 10px; font-weight: 700; line-height: 1;
+  font-size: 13px; font-weight: 700; line-height: 1;
   letter-spacing: .16em;
   color: rgb(255,255,255);
   text-transform: uppercase;
@@ -847,9 +853,11 @@ html, body {
   .header-time {
     font-size: 53px;
   }
-  .header-date,
+  .header-date {
+    font-size: 13px;
+  }
   .header-calendar {
-    font-size: 9px;
+    font-size: 11px;
   }
   .header-status {
     font-size: 18px;
@@ -1175,6 +1183,9 @@ const REFILL_BACKOFF_MS = 45000;
 const SPOTIFY_END_GRACE_MS = 2500;
 let environmentSnapshot = null;
 let environmentSyncInFlight = null;
+let serverSessionActive = false;
+let serverSessionSyncInFlight = null;
+let serverSessionHydratedProgramId = null;
 
 /* ── Random starfield ─────────────────────────────────────────────── */
 function seededRandom(seed) {
@@ -1247,12 +1258,18 @@ function updateEnvironmentUi(snapshot = environmentSnapshot) {
   const now = new Date();
   const timeZone = snapshot?.timeZone || Intl.DateTimeFormat().resolvedOptions().timeZone;
   const locale = snapshot?.locale || navigator.language || 'en-US';
-  headerTime.textContent = now.toLocaleTimeString(locale, {
+  const timeParts = new Intl.DateTimeFormat(locale, {
     timeZone,
     hour: '2-digit',
     minute: '2-digit',
     hourCycle: 'h23',
-  });
+  }).formatToParts(now);
+  headerTime.replaceChildren(...timeParts.map(part => {
+    const node = document.createElement('span');
+    node.textContent = part.value;
+    if (part.type === 'literal') node.className = 'time-separator';
+    return node;
+  }));
   headerDate.textContent = now.toLocaleDateString(locale, {
     timeZone,
     weekday: 'long',
@@ -1394,7 +1411,40 @@ function markUserPlaybackIntent() {
 }
 
 function stationHasPlaybackIntent() {
-  return startingRadio || currentProgramId || queue.length || musicIsPlaying();
+  return serverSessionActive || startingRadio || currentProgramId || queue.length || musicIsPlaying();
+}
+
+async function syncSessionState() {
+  if (serverSessionSyncInFlight) return serverSessionSyncInFlight;
+  serverSessionSyncInFlight = fetch('/api/session')
+    .then(async res => {
+      if (!res.ok) throw new Error(`Session sync failed: ${res.status}`);
+      const session = await res.json();
+      serverSessionActive = Boolean(session.active);
+      if (session.sessionTitle && !sessionTitleEl.textContent) {
+        sessionTitleEl.textContent = session.sessionTitle;
+      }
+      const payload = session.lastProgramPayload;
+      const canHydrateProgram = payload?.programId &&
+        payload.programId !== serverSessionHydratedProgramId &&
+        !currentProgramId &&
+        !queue.length &&
+        playbackIsEmpty();
+      if (canHydrateProgram) {
+        serverSessionHydratedProgramId = payload.programId;
+        handleWsMessage(payload);
+      }
+      return session;
+    })
+    .catch(err => {
+      console.warn('[session-sync]', err);
+      serverSessionActive = false;
+      return null;
+    })
+    .finally(() => {
+      serverSessionSyncInFlight = null;
+    });
+  return serverSessionSyncInFlight;
 }
 
 function scheduleAutoStart(syncPromise = null) {
@@ -1404,6 +1454,7 @@ function scheduleAutoStart(syncPromise = null) {
     if (userPlaybackIntentSeen || stationHasPlaybackIntent()) return;
     try {
       await (syncPromise || environmentSyncInFlight || syncEnvironment());
+      await syncSessionState();
       if (userPlaybackIntentSeen || stationHasPlaybackIntent()) return;
       await startRadio({ automatic: true });
     } catch (err) {
@@ -1638,9 +1689,10 @@ function updateSpotifyProgressUi() {
 function scheduleSpotifyEnd() {
   clearSpotifyTimers();
   if (!spotifyActive || spotifyPaused || !spotifyTrackDurationMs) return;
+  const token = currentPlaybackToken;
   const remainingMs = Math.max(500, spotifyTrackDurationMs - (spotifyTrackPositionMs + Date.now() - spotifyTrackStartedAt));
   spotifyEndTimer = setTimeout(() => {
-    playNext();
+    playNext('spotify-timer', token);
   }, remainingMs + 800);
   spotifyProgressTimer = setInterval(updateSpotifyProgressUi, 1000);
 }
@@ -1711,6 +1763,9 @@ function initSpotifyPlayerWhenReady() {
   });
   spotifyPlayer.addListener('player_state_changed', state => {
     if (!state || !spotifyActive) return;
+    const stateUri = state.track_window?.current_track?.uri || '';
+    if (currentSpotifyUri && stateUri && stateUri !== currentSpotifyUri) return;
+    const token = currentPlaybackToken;
     const now = Date.now();
     const previousPaused = spotifyPaused;
     const previousDurationMs = spotifyTrackDurationMs;
@@ -1737,7 +1792,7 @@ function initSpotifyPlayerWhenReady() {
         duration: nextDurationMs,
       });
       clearSpotifyTimers();
-      playNext();
+      playNext('spotify-state', token);
       return;
     }
     scheduleSpotifyEnd();
@@ -1752,14 +1807,18 @@ if (window.Spotify) initSpotifyPlayerWhenReady();
 musicAudio.addEventListener('play',  () => setPlaying(true));
 musicAudio.addEventListener('pause', () => setPlaying(false));
 musicAudio.addEventListener('ended', () => {
+  const token = currentPlaybackToken;
+  if (!currentAudioSrc) return;
+  if (currentAudioSrc && musicAudio.currentSrc && musicAudio.currentSrc !== currentAudioSrc) return;
   console.info('[music] ended', {
     title: metaName.textContent,
     duration: musicAudio.duration,
     currentTime: musicAudio.currentTime,
   });
-  playNext();
+  playNext('html-ended', token);
 });
 musicAudio.addEventListener('loadedmetadata', () => {
+  currentAudioSrc = musicAudio.currentSrc || currentAudioSrc;
   console.info('[music] metadata', {
     title: metaName.textContent,
     duration: musicAudio.duration,
@@ -1768,9 +1827,11 @@ musicAudio.addEventListener('loadedmetadata', () => {
   maybeRefillAhead();
 });
 musicAudio.addEventListener('error', () => {
+  if (!currentAudioSrc) return;
+  if (musicAudio.currentSrc && musicAudio.currentSrc !== currentAudioSrc) return;
   console.warn('[music] playback failed', musicAudio.error);
   addTurn('Claudio', "That link dropped out. I'll skip ahead and keep the set moving.");
-  playNext();
+  playNext('html-error', currentPlaybackToken);
 });
 /* ── Prefetch next track ──────────────────────────────────────────── */
 const prefetchEl = document.createElement('audio');
@@ -1816,6 +1877,10 @@ playBtn.addEventListener('click', async () => {
     return;
   }
   if (musicAudio.src && musicAudio.ended && playNext()) return;
+  if (queue.length && playbackIsEmpty()) {
+    playTrack(queue[queueIdx] || queue[0]);
+    return;
+  }
   if (!musicAudio.paused) {
     musicAudio.pause();
     return;
@@ -2144,6 +2209,10 @@ let queue = [], queueIdx = 0;
 let autoRefilling = false;
 let segueStarted = false;     // the DJ already spoke over the current song's outro
 let awaitingNextTrack = false;
+let trackAdvancePending = false;
+let currentPlaybackToken = 0;
+let currentSpotifyUri = '';
+let currentAudioSrc = '';
 let outroTalkPromise = null;
 let outroTalkToken = 0;
 let scriptSegments = [];
@@ -2277,6 +2346,9 @@ function voiceChannelBusy() {
 }
 
 function resetProgramPlaybackState() {
+  currentPlaybackToken++;
+  currentSpotifyUri = '';
+  currentAudioSrc = '';
   outroTalkToken++;
   outroTalkPromise = null;
   queue = [];
@@ -2285,6 +2357,7 @@ function resetProgramPlaybackState() {
   handledSegmentIds.clear();
   pendingImmediateSegments = [];
   queuedSegmentIds.clear();
+  trackAdvancePending = false;
   autoRefilling = false;
   segueStarted = false;
   awaitingNextTrack = false;
@@ -2354,28 +2427,6 @@ function rememberOutroTalk(promise) {
   return outroTalkPromise;
 }
 
-function playTrackAfterOutroTalk(track) {
-  const pendingOutro = outroTalkPromise;
-  if (pendingOutro) {
-    pendingOutro.then(() => playTrack(track));
-    return;
-  }
-  if (!ttsAudio.paused && !ttsAudio.ended) {
-    let started = false;
-    const startTrack = () => {
-      if (started) return;
-      started = true;
-      ttsAudio.removeEventListener('ended', startTrack);
-      ttsAudio.removeEventListener('error', startTrack);
-      playTrack(track);
-    };
-    ttsAudio.addEventListener('ended', startTrack, { once: true });
-    ttsAudio.addEventListener('error', startTrack, { once: true });
-    return;
-  }
-  playTrack(track);
-}
-
 // Called in the last seconds of a song: bring the DJ in over the fade, like real radio.
 function maybeStartOutroTalk() {
   if (segueStarted) return;
@@ -2415,6 +2466,7 @@ function maybeStartOutroTalk() {
 // Keep enough music buffered that Claude can be slow without the station falling silent.
 function maybeRefillAhead() {
   if (!queue.length || autoRefilling) return;
+  if (!musicIsPlaying() && !awaitingNextTrack) return;
   if (Date.now() - lastRefillAt < REFILL_BACKOFF_MS) return;
   const remainingTracks = queue.length - queueIdx - 1;
   const bufferedTracks = queue.length - queueIdx;
@@ -2557,6 +2609,9 @@ function autoRefill() {
 
 async function playTrack(track) {
   awaitingNextTrack = false;
+  currentPlaybackToken++;
+  currentSpotifyUri = track.spotifyUri || '';
+  currentAudioSrc = '';
   currentTrackStartedAt = Date.now();
   renderQueue();
   const title = trackTitle(track);
@@ -2605,6 +2660,7 @@ async function playTrack(track) {
   }
 
   spotifyActive = false;
+  currentSpotifyUri = '';
   clearSpotifyTimers();
   if (!track.streamUrl) {
     if (track.spotifyUri) {
@@ -2617,6 +2673,7 @@ async function playTrack(track) {
   }
   setStationNotice('');
   musicAudio.src = track.streamUrl;
+  currentAudioSrc = musicAudio.currentSrc || track.streamUrl;
   setPlaybackVolume((!ttsAudio.paused && !ttsAudio.ended) ? duckedMusicVolume() : baseMusicVolume);
   musicAudio.play().catch(err => {
     console.error(err);
@@ -2627,30 +2684,55 @@ async function playTrack(track) {
   });
 }
 
-function playNext() {
+function playNext(reason = 'unknown', token = currentPlaybackToken) {
+  if (token !== currentPlaybackToken) {
+    console.info('[transition] stale advance ignored', { reason, token, currentPlaybackToken });
+    return false;
+  }
+  if (trackAdvancePending) return true;
   if (queueIdx < queue.length - 1) {
     awaitingNextTrack = false;
+    trackAdvancePending = true;
+    const transitionToken = currentPlaybackToken;
     const spokenDuringOutro = segueStarted;
-    queueIdx++;
-    segueStarted = false;
-    renderQueue();
-    const track = queue[queueIdx];
+    const nextIndex = queueIdx + 1;
+    const track = queue[nextIndex];
     const beforeTrackSegments = findSegments(segment =>
       segment.position === 'before_track' &&
-      segment.trackIndex === queueIdx
+      segment.trackIndex === nextIndex
     );
-    if (spokenDuringOutro) {
-      // Claudio already talked over the outro. Let the whole bridge finish before the next song.
-      playTrackAfterOutroTalk(track);
-    } else if (beforeTrackSegments.length) {
-      speakSegmentSequence(beforeTrackSegments, () => playTrack(track));
-    } else if (track.introTtsUrl) {
-      // Fallback (short song / seek): no outro segue happened, so talk now then play.
-      speakSegment(track.introTranscript, track.introTtsUrl, () => playTrack(track));
-    } else {
+
+    let started = false;
+    const startNextTrack = () => {
+      if (started) return;
+      if (transitionToken !== currentPlaybackToken) {
+        console.info('[transition] stale deferred start ignored', { reason, transitionToken, currentPlaybackToken });
+        return;
+      }
+      started = true;
+      queueIdx = nextIndex;
+      segueStarted = false;
+      trackAdvancePending = false;
+      console.info('[transition] advance', { reason, from: queueIdx - 1, to: nextIndex });
       playTrack(track);
+      maybeRefillAhead();
+    };
+
+    if (spokenDuringOutro && outroTalkPromise) {
+      // Claudio is still finishing the seam over the outro. Keep the current
+      // track as "current" until that talk is done, then advance atomically.
+      outroTalkPromise.then(startNextTrack);
+    } else if (!spokenDuringOutro && beforeTrackSegments.length) {
+      speakSegmentSequence(beforeTrackSegments, startNextTrack);
+    } else if (!spokenDuringOutro && track.introTtsUrl) {
+      // Fallback (short song / seek): no outro segue happened, so talk now then play.
+      speakSegment(track.introTranscript, track.introTtsUrl, startNextTrack);
+    } else if (!ttsAudio.paused && !ttsAudio.ended) {
+      ttsAudio.addEventListener('ended', startNextTrack, { once: true });
+      ttsAudio.addEventListener('error', startNextTrack, { once: true });
+    } else {
+      startNextTrack();
     }
-    maybeRefillAhead();
     return true;
   }
   awaitingNextTrack = true;
@@ -2678,16 +2760,21 @@ function enqueueTracks(tracks) {
 }
 
 function enqueueAndPlay(tracks, { autoPlay = true } = {}) {
-  const shouldAutoResume = autoPlay && (awaitingNextTrack || playbackIsEmpty());
+  const queueWasEmpty = queue.length === 0;
+  const voiceBusy = voiceChannelBusy();
   const freshTracks = enqueueTracks(tracks);
   if (!freshTracks.length) return freshTracks;
+  const shouldAutoResume = autoPlay && !voiceBusy && (
+    awaitingNextTrack ||
+    (queueWasEmpty && playbackIsEmpty())
+  );
   if (shouldAutoResume) {
     awaitingNextTrack = false;
     segueStarted = false;
     queueIdx = queue.length - freshTracks.length;
     playTrack(queue[queueIdx]);
   }
-  maybeRefillAhead();
+  if (shouldAutoResume || musicIsPlaying() || awaitingNextTrack) maybeRefillAhead();
   return freshTracks;
 }
 
@@ -2768,6 +2855,7 @@ function handleWsMessage(msg) {
   }
 
   if (msg.type === 'program-start') {
+    serverSessionActive = true;
     if (msg.programId && currentProgramId && msg.programId !== currentProgramId) {
       resetProgramPlaybackState();
     }
@@ -2787,31 +2875,30 @@ function handleWsMessage(msg) {
       segment.position === 'immediate' ||
       (segment.position === 'before_track' && (segment.trackIndex ?? 0) === queueIdx)
     );
-    if (tracks.length && msg.openingLeadIn && immediateSegments.length && playbackIsEmpty()) {
+    if (tracks.length && msg.openingReady && immediateSegments.length && playbackIsEmpty()) {
       const freshTracks = enqueueAndPlay(tracks, { autoPlay: false });
       renderStationContext({ signal: msg.signal === 'backup' ? 'backup' : 'live' });
       if (freshTracks.length) {
-        const leadInSegments = immediateSegments.map((segment, index) => ({
+        const openingSegments = immediateSegments.map((segment, index) => ({
           ...segment,
           resetClockOnSpeak: index === 0,
         }));
-        speakSegmentSequence(leadInSegments, () => {
+        speakSegmentSequence(openingSegments, () => {
           if (playbackIsEmpty() && queue[queueIdx]) playTrack(queue[queueIdx]);
           maybeRefillAhead();
         });
-        if (msg.openingPending) addSystemLine('Claudio is writing the full opening link…');
         return;
       }
     }
     if (tracks.length) enqueueAndPlay(tracks);
     renderStationContext({ signal: msg.signal === 'backup' ? 'backup' : 'live' });
     if (immediateSegments.length) queueImmediateSegments(immediateSegments);
-    if (msg.openingPending) addSystemLine('Music is live. Claudio is writing the opening link…');
     return;
   }
 
   if (msg.type === 'tracks-ready') {
     if (msg.programId && currentProgramId && msg.programId !== currentProgramId) return;
+    serverSessionActive = true;
     currentProgramId = msg.programId || currentProgramId;
     autoRefilling = false;
     if (msg.tracks?.length) enqueueAndPlay(msg.tracks, { autoPlay: !msg.tail });
@@ -2823,12 +2910,6 @@ function handleWsMessage(msg) {
     if (msg.programId && currentProgramId && msg.programId !== currentProgramId) return;
     currentProgramId = msg.programId || currentProgramId;
     const incomingSegments = normalizeIncomingSegments(msg);
-    if (msg.openingContinuation && currentTrackStartedAt) {
-      const windowMs = Number(msg.continuationWindowMs || 9000);
-      if (Date.now() - currentTrackStartedAt > windowMs) {
-        return;
-      }
-    }
     scriptSegments = [...scriptSegments, ...incomingSegments];
     const immediateSegments = findSegments(segment =>
       segment.position === 'immediate' ||
@@ -2852,11 +2933,12 @@ function handleWsMessage(msg) {
       }
     }
     if (msg.jobType === 'program_start') {
+      if (!currentProgramId && !queue.length) serverSessionActive = false;
       startingRadio = false;
       playBtn.disabled = false;
       setRadioStatus('Paused');
       metaSub.textContent = '';
-      addSystemLine('Could not start Claudio FM');
+      addSystemLine(msg.userMessage || userFacingSystemMessage(msg.error || 'Could not start Claudio FM'));
     }
     return;
   }
