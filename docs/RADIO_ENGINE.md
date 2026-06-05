@@ -36,13 +36,17 @@ Core modules:
 6. Speech-only conversation goes through `runRadioSegment` and returns an
    immediate spoken response without adding music.
 
-Program start jobs now prioritize the first playable track, then block first
-playback until the full cold open script and TTS are ready. The browser speaks
-the complete cold open before starting the first song.
+Program start jobs now prioritize the first playable track with bounded
+parallel candidate lookup. By default, the first broadcast waits only for one
+short confirmed-track opening line and its TTS, then starts the first song while
+the fuller cold open continuation is generated in the background. Set
+`PROGRAM_START_QUICK_OPEN=0` to restore the older fully-blocking opening path.
 
 The remaining startup tracks are resolved by `music_tail_resolve` and appended
 with `tracks-ready`. Bridge scripts are generated in background jobs after the
-first song path is already moving.
+first song path is already moving. If bridge writing is disabled or the LLM
+fails, the server emits a short local bridge or deliberate silence instead of a
+failed background job.
 
 When `program_start` finishes, the server logs one structured
 `[metric:program_start:summary]` line with `choose_tracks_ms`,
@@ -70,8 +74,8 @@ Important WebSocket events:
 
 - `job-status`: phase and failure updates for UI status text.
 - `program-start`: new program, first confirmed tracks, program arc, and the
-  complete synthesized cold open segments that should play before the first
-  song.
+  synthesized opening segments that should play before the first song. With
+  quick open enabled, this contains only the first confirmed-track lead-in.
 - `tracks-ready`: tail-resolved or refill tracks appended to the existing
   program.
 - `segment-ready`: DJ opening continuation or bridge segments ready for
@@ -99,8 +103,9 @@ does not reset playback.
 DJ voice is serialized through a voice channel:
 
 - When `program-start` includes `openingReady`, the browser queues the tracks
-  but waits for the complete cold open sequence to finish before starting the
-  first song.
+  but waits for the included opening sequence to finish before starting the
+  first song. Background `opening_generation` may later emit continuation
+  segments as `segment-ready`.
 - Request-line caller voice blocks immediate DJ interruptions until it finishes.
 - Immediate segments are queued and de-duplicated by segment key.
 - Bridge segments are delivered at song seams when possible.
@@ -125,6 +130,8 @@ These `.env` values are the main controls for startup speed and resilience:
 | `CODEX_IGNORE_RULES` | `1` | Passes `--ignore-rules` to the radio subprocess so project coding-agent rules do not add unrelated startup work. |
 | `CODEX_OUTPUT_SCHEMA` | `schemas/llm-response.schema.json` | JSON schema passed to `codex exec --output-schema`. |
 | `LLM_SUBPROCESS_CONCURRENCY` | `1` | Serializes LLM subprocess work so background bridge/refill jobs do not compete with opening generation. |
+| `PROGRAM_START_QUICK_OPEN` | `1` | Starts after one confirmed-track opening line, then generates the fuller cold open continuation in the background. Set `0` to wait for the full cold open before first playback. |
+| `BRIDGE_LLM_ENABLED` | `1` | Enables LLM bridge writing. Set `0` to use local short handoffs or deliberate silence for faster, deterministic bridges. |
 | `PROGRAM_START_LLM_TIMEOUT_MS` | `180000` | Timeout for automatic opening track selection. |
 | `COLD_OPEN_LLM_TIMEOUT_MS` | `180000` | Timeout for full cold open writing after tracks are known. |
 | `DIRECT_COLD_OPEN_LLM_TIMEOUT_MS` | `150000` | Timeout for direct request cold opens, which should be narrower than automatic openings. |
@@ -137,6 +144,7 @@ These `.env` values are the main controls for startup speed and resilience:
 | `MUSIC_LOOKUP_CACHE_TTL_MS` | `900000` | In-memory TTL for successful Spotify track and artist lookups. |
 | `MUSIC_NEGATIVE_CACHE_TTL_MS` | `120000` | In-memory TTL for failed Spotify lookups. |
 | `MUSIC_LOOKUP_CACHE_MAX_ENTRIES` | `200` | Maximum in-memory Spotify lookup cache entries. Oldest entries are pruned first. |
+| `SPOTIFY_SEARCH_LIMIT` | `10` | Number of Spotify candidates considered per query variant before local scoring picks the best result. |
 | `SCHEDULER_INTERRUPT_ACTIVE_PROGRAM` | `0` | Set to `1` only if scheduled programs may replace an active show. |
 | `SPOTIFY_FAST_START` | `1` | When enabled, Spotify hits skip stream fallback and play through Spotify Web Playback URI. |
 | `TTS_SYNTH_CONCURRENCY` | `3` | Parallel DJ segment TTS synthesis count. |

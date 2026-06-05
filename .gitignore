@@ -6,6 +6,7 @@ kororo-voice/
 *.sqlite
 *.db
 Kokoro-FastAPI/
+CosyVoice/
 
 # Local agent/development memory
 .agents/

@@ -10,11 +10,6 @@ function ytDlpFallbackEnabled() {
   return fallbackProvider() === 'yt-dlp';
 }
 
-async function getStreamUrl(query) {
-  const track = await getTrack(query);
-  return track?.streamUrl || null;
-}
-
 async function getTrack(query) {
   const provider = process.env.MUSIC_PROVIDER || 'auto';
   console.log(`[音乐] 搜索: "${query}" (来源: ${provider})`);
@@ -80,4 +75,4 @@ async function getArtistTracks(query, count = 3, options = {}) {
   return [];
 }
 
-module.exports = { getStreamUrl, getTrack, getArtistTracks, searchUrl: ytDlp.searchUrl };
+module.exports = { getTrack, getArtistTracks };

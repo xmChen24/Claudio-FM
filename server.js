@@ -186,6 +186,12 @@ function envNumber(name, fallback) {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
+function envFlag(name, defaultEnabled = false) {
+  const value = process.env[name];
+  if (value === undefined || value === '') return defaultEnabled;
+  return /^(1|true|yes|on)$/i.test(value);
+}
+
 function llmOptionsForPhase(phase) {
   const prefix = String(phase || '').toUpperCase().replace(/[^A-Z0-9]+/g, '_');
   const timeoutMs = envNumber(`${prefix}_LLM_TIMEOUT_MS`, envNumber('LLM_TIMEOUT_MS', 120000));
@@ -253,6 +259,8 @@ const TTS_SYNTH_CONCURRENCY = Math.max(1, Number(process.env.TTS_SYNTH_CONCURREN
 const TTS_SYNTH_RETRIES = Math.max(0, Number(process.env.TTS_SYNTH_RETRIES || 2));
 const DIRECT_ARTIST_TRACK_COUNT = Math.max(1, Number(process.env.DIRECT_ARTIST_TRACK_COUNT || 3));
 const LLM_SUBPROCESS_CONCURRENCY = Math.max(1, Number(process.env.LLM_SUBPROCESS_CONCURRENCY || 1));
+const PROGRAM_START_QUICK_OPEN = envFlag('PROGRAM_START_QUICK_OPEN', true);
+const BRIDGE_LLM_ENABLED = envFlag('BRIDGE_LLM_ENABLED', true);
 const FALLBACK_PROGRAM_TRACKS = [
   'Sweet Disposition - The Temper Trap',
   'Ventura Highway - America',
@@ -679,6 +687,96 @@ function fallbackOpeningLeadIn(firstTrack, djLanguage = 'en') {
   return variants[index];
 }
 
+function coldOpenSegmentsFromResult(result = {}) {
+  return Array.isArray(result.segments)
+    ? result.segments.filter(segment => segment?.type === 'cold_open' && typeof segment.text === 'string' && segment.text.trim())
+    : [];
+}
+
+function buildQuickColdOpenSegments({ job = {}, result = {}, tracks = [] } = {}) {
+  const reusable = provisionalColdOpenMatchesResolvedTrack(result, tracks);
+  const sourceSegment = reusable ? coldOpenSegmentsFromResult(result)[0] : null;
+  const text = sourceSegment?.text?.trim() || fallbackOpeningLeadIn(tracks[0], job.djLanguage);
+  return [{
+    ...(sourceSegment || {}),
+    type: 'cold_open',
+    groupId: 'open_0',
+    part: sourceSegment?.part || 'lead_in',
+    position: 'before_track',
+    trackIndex: 0,
+    text,
+  }];
+}
+
+function dropConsumedColdOpenSegments(segments = [], consumedText = '') {
+  const normalizedConsumed = normalizeTrackText(consumedText);
+  let dropped = false;
+  const remaining = [];
+  for (const segment of segments) {
+    if (!dropped) {
+      const normalizedSegment = normalizeTrackText(segment?.text || '');
+      if (!normalizedConsumed || normalizedSegment === normalizedConsumed) {
+        dropped = true;
+        continue;
+      }
+    }
+    remaining.push(segment);
+  }
+  return remaining;
+}
+
+async function synthesizeQuickColdOpen({ job, result = {}, tracks = [], failedTracks = [], timing }) {
+  const quickSegments = buildQuickColdOpenSegments({ job, result, tracks });
+  const quickResult = { ...result, segments: quickSegments };
+  broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'phase', phase: 'voice_open' });
+  const segments = await synthesizeSegments(normalizeSegments(quickResult, tracks, false, failedTracks));
+  timing.mark('quick_voice_open_ms');
+  return { segments, reason: result.reason, leadInText: quickSegments.map(segment => segment.text).filter(Boolean).join(' ') };
+}
+
+function fallbackBridgeResult(job = {}) {
+  const after = job.afterTrack || {};
+  const before = job.beforeTrack || {};
+  const djLanguage = normalizeDjLanguage(job.djLanguage);
+  const beforeLabel = before.artist || before.title || before.query || '';
+  const sameArtist = normalizeTrackText(after.artist) && normalizeTrackText(after.artist) === normalizeTrackText(before.artist);
+  const quietChoice = !beforeLabel || Math.abs(hashText(`${trackLabel(after)}>${trackLabel(before)}`)) % 5 === 0;
+
+  if (quietChoice) {
+    return {
+      segments: [{
+        type: 'silence',
+        position: 'between_tracks',
+        afterTrackIndex: job.afterTrackIndex,
+        beforeTrackIndex: job.beforeTrackIndex,
+        text: '',
+      }],
+      reason: 'local bridge fallback: silence',
+    };
+  }
+
+  const text = djLanguage === 'zh'
+    ? sameArtist
+      ? `${before.artist} 的线索还在，下一首换一层光。`
+      : `刚才的余温留住一点，${beforeLabel} 接住下一段。`
+    : sameArtist
+      ? `${before.artist} stays in the room, just under a different light.`
+      : `Let that last color hang; ${beforeLabel} takes it from here.`;
+
+  return {
+    segments: [{
+      type: 'bridge',
+      groupId: `bridge_${job.afterTrackIndex}_${job.beforeTrackIndex}`,
+      part: 'handoff',
+      position: 'between_tracks',
+      afterTrackIndex: job.afterTrackIndex,
+      beforeTrackIndex: job.beforeTrackIndex,
+      text,
+    }],
+    reason: 'local bridge fallback',
+  };
+}
+
 function hashText(value) {
   let hash = 0;
   for (const char of String(value || '')) {
@@ -797,6 +895,29 @@ function normalizeTrackText(value) {
     .trim();
 }
 
+function canonicalTrackText(value) {
+  return normalizeTrackText(value)
+    .replace(/\b(feat|ft|featuring)\b.*$/i, '')
+    .replace(/\b\d{2,4}\s*(remaster(?:ed)?|remix|mix|version)\b/gi, '')
+    .replace(/\b(remaster(?:ed)?|remix|mix|version|edit|mono|stereo|deluxe|expanded|bonus|anniversary)\b/gi, '')
+    .replace(/\b(live|acoustic|karaoke|instrumental|sped up|slowed|nightcore)\b/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function stripTrackTextNoise(value) {
+  return String(value || '')
+    .replace(/\s*[\[(（【].*?[\])）】]\s*/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function significantTrackTokens(value) {
+  return normalizeTrackText(value)
+    .split(' ')
+    .filter(token => token.length > 1 || hasCjk(token));
+}
+
 function trackIdentity(track) {
   const title = normalizeTrackText(track?.title || track?.query || '');
   const artist = normalizeTrackText(track?.artist || '');
@@ -838,14 +959,30 @@ function titleMatchScore(requestedTitle, resolvedTitle) {
   if (requestedTitle === resolvedTitle) return 120;
   if (phraseContains(resolvedTitle, requestedTitle)) return 100;
   if (resolvedTitle.length >= 2 && phraseContains(requestedTitle, resolvedTitle)) return 85;
-  const requestedTokens = requestedTitle.split(' ').filter(Boolean);
-  const resolvedTokens = resolvedTitle.split(' ').filter(Boolean);
+  const requestedCanonical = canonicalTrackText(stripTrackTextNoise(requestedTitle));
+  const resolvedCanonical = canonicalTrackText(stripTrackTextNoise(resolvedTitle));
+  if (requestedCanonical && resolvedCanonical) {
+    if (requestedCanonical === resolvedCanonical) return 112;
+    if (phraseContains(resolvedCanonical, requestedCanonical)) return 98;
+    if (resolvedCanonical.length >= 2 && phraseContains(requestedCanonical, resolvedCanonical)) return 84;
+  }
+  const requestedTokens = significantTrackTokens(requestedCanonical || requestedTitle);
+  const resolvedTokens = significantTrackTokens(resolvedCanonical || resolvedTitle);
   if (!requestedTokens.length || !resolvedTokens.length) return 0;
-  const overlap = requestedTokens.filter(token => resolvedTokens.includes(token)).length;
+  const overlap = requestedTokens.filter(token =>
+    resolvedTokens.some(candidate => trackTokenMatches(token, candidate))
+  ).length;
   const ratio = overlap / Math.max(requestedTokens.length, 1);
   if (ratio >= 0.8) return 75;
   if (ratio >= 0.5) return 50;
   return 0;
+}
+
+function trackTokenMatches(requested, candidate) {
+  if (!requested || !candidate) return false;
+  if (requested === candidate) return true;
+  if (hasCjk(requested) || hasCjk(candidate)) return candidate.includes(requested) || requested.includes(candidate);
+  return requested.length >= 4 && candidate.startsWith(requested);
 }
 
 function hasCjk(value) {
@@ -979,21 +1116,100 @@ async function resolveRequestedTracks(requestedTracks, options = {}) {
   return { tracks, failedTracks };
 }
 
+async function lookupPlayableCandidate(query, i, avoidState, enforceAvoidance) {
+  try {
+    const track = await getTrack(query);
+    if (!track?.streamUrl && !track?.spotifyUri) {
+      return { i, query, failedTracks: [query], track: null };
+    }
+
+    const requested = parseRequestedTrack(query);
+    if (!trackMatchesRequest(requested, track)) {
+      const resolvedLabel = `${track.title}${track.artist ? ' — ' + track.artist : ''}`;
+      console.log(`[音乐] ↷ ${i + 1} 跳过错配: 请求 "${query}"，返回 "${resolvedLabel}"`);
+      return { i, query, failedTracks: [`${query} (resolved mismatch: ${resolvedLabel})`], track: null };
+    }
+
+    const payloadTrack = payloadTrackFromResolved(query, requested, track);
+    if (enforceAvoidance) {
+      const skip = shouldSkipTrack(payloadTrack, avoidState);
+      if (skip.skip) {
+        console.log(`[音乐] ↷ ${i + 1} 跳过重复: ${payloadTrack.title}${payloadTrack.artist ? ' — ' + payloadTrack.artist : ''} | ${skip.reason}`);
+        return { i, query, failedTracks: [`${query} (${skip.reason})`], track: null };
+      }
+    }
+
+    return { i, query, failedTracks: [], track: payloadTrack };
+  } catch (err) {
+    console.warn(`[音乐] ✗ ${i + 1} 解析失败: ${query} | ${err.message}`);
+    return { i, query, failedTracks: [`${query} (${err.message})`], track: null };
+  }
+}
+
 async function resolveFirstPlayableTrack(requestedTracks, options = {}) {
   const requested = Array.isArray(requestedTracks) ? requestedTracks.filter(Boolean) : [];
-  const failedTracks = [];
-  for (let i = 0; i < requested.length; i++) {
-    const resolved = await resolveRequestedTracks([requested[i]], options);
-    failedTracks.push(...resolved.failedTracks);
-    if (resolved.tracks.length) {
-      return {
-        tracks: resolved.tracks,
-        failedTracks,
-        remainingPlay: requested.slice(i + 1),
-      };
-    }
-  }
-  return { tracks: [], failedTracks, remainingPlay: [] };
+  if (!requested.length) return { tracks: [], failedTracks: [], remainingPlay: [] };
+
+  const avoidState = createTrackAvoidState(options.queue || []);
+  const enforceAvoidance = options.enforceAvoidance !== false;
+  const results = new Array(requested.length);
+  const concurrency = Math.min(Math.max(1, MUSIC_RESOLVE_CONCURRENCY), requested.length);
+  let nextIndex = 0;
+  let active = 0;
+  let completed = 0;
+  let settled = false;
+
+  return new Promise(resolve => {
+    const finishIfReady = () => {
+      if (settled) return;
+      for (let i = 0; i < requested.length; i++) {
+        if (!results[i]) return;
+        if (results[i].track) {
+          settled = true;
+          const payloadTrack = results[i].track;
+          avoidState.batchTrackKeys.add(trackIdentity(payloadTrack));
+          const urlIdentity = trackUrlIdentity(payloadTrack);
+          if (urlIdentity) avoidState.batchUrlKeys.add(urlIdentity);
+          addPlay({ title: payloadTrack.title, artist: payloadTrack.artist, source_url: payloadTrack.streamUrl || payloadTrack.spotifyUri });
+          console.log(`[音乐] ✓ ${i + 1}/${requested.length} 首个可播: ${payloadTrack.title}${payloadTrack.artist ? ' — ' + payloadTrack.artist : ''}`);
+          resolve({
+            tracks: [payloadTrack],
+            failedTracks: results.slice(0, i).flatMap(item => item?.failedTracks || []),
+            remainingPlay: requested.slice(i + 1),
+          });
+          return;
+        }
+      }
+      if (completed >= requested.length) {
+        settled = true;
+        resolve({
+          tracks: [],
+          failedTracks: results.flatMap(item => item?.failedTracks || []),
+          remainingPlay: [],
+        });
+      }
+    };
+
+    const launch = () => {
+      while (!settled && active < concurrency && nextIndex < requested.length) {
+        const i = nextIndex++;
+        active++;
+        lookupPlayableCandidate(requested[i], i, avoidState, enforceAvoidance)
+          .then(result => { results[i] = result; })
+          .catch(err => {
+            results[i] = { i, query: requested[i], failedTracks: [`${requested[i]} (${err.message})`], track: null };
+          })
+          .finally(() => {
+            active--;
+            completed++;
+            finishIfReady();
+            launch();
+          });
+      }
+    };
+
+    launch();
+  });
 }
 
 async function resolveDirectMusicRequest(request = {}) {
@@ -1385,15 +1601,18 @@ async function runProgramStartJob(job) {
       correctionContext: job.correctionContext,
     });
     timing.mark('first_music_ready_ms');
-    const opening = await generateColdOpenSegments({
-      job,
-      result,
-      tracks,
-      failedTracks,
-      programArc,
-      timing,
-      llmPhase: job.musicRequest ? 'direct_cold_open' : 'cold_open',
-    });
+    const quickOpen = PROGRAM_START_QUICK_OPEN;
+    const opening = quickOpen
+      ? await synthesizeQuickColdOpen({ job, result, tracks, failedTracks, timing })
+      : await generateColdOpenSegments({
+        job,
+        result,
+        tracks,
+        failedTracks,
+        programArc,
+        timing,
+        llmPhase: job.musicRequest ? 'direct_cold_open' : 'cold_open',
+      });
     if (autoStartInvalidated(job)) {
       console.log(`[program_start] 自动开台 cold open 已被用户请求取代 ${job.key}`);
       return null;
@@ -1421,10 +1640,29 @@ async function runProgramStartJob(job) {
       reason: opening.reason || result.reason,
       signal: backupSignal ? 'backup' : 'live',
       openingReady: true,
-      metrics: timing.summary({ firstMusicReady: true }),
+      openingComplete: !quickOpen,
+      quickOpen,
+      metrics: timing.summary({ firstMusicReady: true, quickOpen }),
     };
     stationState.lastProgramPayload = payload;
     broadcast(payload);
+
+    if (quickOpen) {
+      enqueueJob({
+        type: 'opening_generation',
+        key: `opening:${programId}`,
+        programId,
+        result,
+        tracks,
+        failedTracks,
+        programArc,
+        leadInText: opening.leadInText || '',
+        continuationOnly: true,
+        musicRequest: job.musicRequest,
+        djLanguage: job.djLanguage,
+        hostMode: job.hostMode,
+      });
+    }
 
     if (remainingPlay.length) {
       enqueueJob({
@@ -1494,12 +1732,25 @@ function provisionalColdOpenMatchesResolvedTrack(result = {}, tracks = []) {
   return trackMatchesRequest(requested, firstTrack);
 }
 
-async function generateColdOpenSegments({ job, result = {}, tracks = [], failedTracks = [], programArc = null, timing, llmPhase = 'cold_open' }) {
+async function generateColdOpenSegments({
+  job,
+  result = {},
+  tracks = [],
+  failedTracks = [],
+  programArc = null,
+  timing,
+  llmPhase = 'cold_open',
+  leadInText = '',
+  continuationOnly = false,
+}) {
   let coldOpenSegments = (result.segments || []).filter(segment => segment?.type === 'cold_open');
   let coldOpenReason = result.reason;
 
   if (coldOpenSegments.length && provisionalColdOpenMatchesResolvedTrack(result, tracks)) {
     console.log('[program_start] 复用选歌阶段 cold_open，跳过第二次 LLM');
+    if (continuationOnly) {
+      coldOpenSegments = dropConsumedColdOpenSegments(coldOpenSegments, leadInText);
+    }
     timing.mark('write_open_reused_ms');
   } else {
     if (coldOpenSegments.length) {
@@ -1514,7 +1765,7 @@ async function generateColdOpenSegments({ job, result = {}, tracks = [], failedT
       musicRequest: job.musicRequest,
       programArc: programArc || job.programArc || stationState.programArc,
       correctionContext: job.correctionContext,
-      leadInText: '',
+      leadInText,
       djLanguage: job.djLanguage,
       hostMode: job.hostMode,
       directRequest: Boolean(job.musicRequest),
@@ -1532,7 +1783,7 @@ async function generateColdOpenSegments({ job, result = {}, tracks = [], failedT
     }
   }
 
-  if (!coldOpenSegments.length && tracks[0]) {
+  if (!coldOpenSegments.length && tracks[0] && !continuationOnly) {
     coldOpenSegments = [{
       type: 'cold_open',
       groupId: 'open_0',
@@ -1541,6 +1792,11 @@ async function generateColdOpenSegments({ job, result = {}, tracks = [], failedT
       trackIndex: 0,
       text: fallbackOpeningLeadIn(tracks[0], job.djLanguage),
     }];
+  }
+
+  if (!coldOpenSegments.length) {
+    timing.mark('voice_open_skipped_ms');
+    return { segments: [], reason: coldOpenReason };
   }
 
   broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'phase', phase: 'voice_open' });
@@ -1565,6 +1821,8 @@ async function runOpeningGenerationJob(job) {
     programArc: job.programArc || stationState.programArc,
     timing,
     llmPhase: job.musicRequest ? 'direct_cold_open' : 'cold_open',
+    leadInText: job.leadInText || '',
+    continuationOnly: Boolean(job.continuationOnly),
   });
 
   if (isStaleProgramJob(job)) {
@@ -1704,18 +1962,30 @@ async function runMusicRefillJob(job) {
 
 async function runBridgeGenerationJob(job) {
   const timing = metricTimer('bridge_generation');
-  const prompt = buildBridgePrompt({
-    programTitle: job.sessionTitle || stationState.sessionTitle,
-    afterTrack: job.afterTrack,
-    beforeTrack: job.beforeTrack,
-    afterTrackIndex: job.afterTrackIndex,
-    beforeTrackIndex: job.beforeTrackIndex,
-    djLanguage: job.djLanguage,
-    hostMode: job.hostMode,
-    programArc: job.programArc || stationState.programArc,
-  });
-  const result = await callRadioLlm(prompt, 'bridge');
-  timing.mark('write_bridge_ms');
+  let result;
+  if (BRIDGE_LLM_ENABLED) {
+    const prompt = buildBridgePrompt({
+      programTitle: job.sessionTitle || stationState.sessionTitle,
+      afterTrack: job.afterTrack,
+      beforeTrack: job.beforeTrack,
+      afterTrackIndex: job.afterTrackIndex,
+      beforeTrackIndex: job.beforeTrackIndex,
+      djLanguage: job.djLanguage,
+      hostMode: job.hostMode,
+      programArc: job.programArc || stationState.programArc,
+    });
+    try {
+      result = await callRadioLlm(prompt, 'bridge');
+      timing.mark('write_bridge_ms');
+    } catch (err) {
+      console.warn(`[bridge_generation] LLM unavailable, using local bridge fallback: ${err.message}`);
+      result = fallbackBridgeResult(job);
+      timing.mark('write_bridge_fallback_ms');
+    }
+  } else {
+    result = fallbackBridgeResult(job);
+    timing.mark('write_bridge_local_ms');
+  }
   if (isStaleProgramJob(job)) {
     console.log(`[bridge_generation] skip stale bridge for ${job.programId}`);
     return [];

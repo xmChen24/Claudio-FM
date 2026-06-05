@@ -64,4 +64,4 @@ async function getTrack(query) {
   };
 }
 
-module.exports = { getStreamUrl, getTrack, searchUrl };
+module.exports = { getStreamUrl, getTrack };

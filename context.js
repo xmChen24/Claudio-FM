@@ -87,14 +87,14 @@ function djLanguageInstruction(language, scope = 'spoken segment text') {
 
 function coldOpenLengthInstruction(language) {
   return normalizeDjLanguage(language) === 'zh'
-    ? 'The full cold open should use concrete musical detail and connect to the current moment, usually 120-220 Chinese characters across all cold_open parts.'
-    : 'The full cold open should use concrete musical detail and connect to the current moment, usually 80-140 English words across all cold_open parts.';
+    ? 'The full cold open should sound like live radio, use concrete musical detail, and stay around 70-140 Chinese characters across all cold_open parts.'
+    : 'The full cold open should sound like live radio, use concrete musical detail, and stay around 45-90 English words across all cold_open parts.';
 }
 
 function bridgeLengthInstruction(language) {
   return normalizeDjLanguage(language) === 'zh'
-    ? 'Bridge segments should be tighter than cold opens, usually 40-90 Chinese characters total. Silence segments are valid deliberate choices.'
-    : 'Bridge segments should be tighter than cold opens, usually 25-60 English words total. Silence segments are valid deliberate choices.';
+    ? 'Bridge segments should be brief and conversational, usually 18-55 Chinese characters total. Silence segments are valid deliberate choices.'
+    : 'Bridge segments should be brief and conversational, usually 12-35 English words total. Silence segments are valid deliberate choices.';
 }
 
 function buildPrompt(userInput, queueState = '', options = {}) {
@@ -128,7 +128,7 @@ function buildPrompt(userInput, queueState = '', options = {}) {
       'Avoid artists that appear in the most recent 5 played songs unless the listener explicitly asked for that artist.',
       '"title" is a 2–4 word evocative segment name (or "" if nothing fits).',
       'Return "segments" as an array of radio script actions. Supported types: cold_open, bridge, quick_touch, back_announce, silence. Supported positions: before_track, between_tracks, after_track, immediate.',
-      'For normal music sets, include a cold open before trackIndex 0 unless silence is clearly better. Write it as 3–5 consecutive cold_open segments, each with one sentence, the same position/trackIndex, and optional part values: anchor, heart, turn, image, invitation.',
+      'For normal music sets, include a cold open before trackIndex 0 unless silence is clearly better. Write it as 2–4 consecutive cold_open segments, each with one sentence, the same position/trackIndex, and optional part values: anchor, heart, turn, invitation.',
       coldOpenLengthInstruction(djLanguage),
       `Bridge segments should be bound between tracks with afterTrackIndex and beforeTrackIndex. ${bridgeLengthInstruction(djLanguage)}`,
       'Vary your rhythm: do not narrate every track the same way. If your recent on-air lines in the dialog history were long, keep this one short or silent. The music is the point; your voice frames it.',
@@ -160,7 +160,7 @@ function buildProgramStartPrompt(userInput, queueState = '', options = {}) {
       'The "title" should use the same language as the DJ narration.',
       'Return only fields allowed by the JSON schema. Use title, play, segments, reason, mode, say, and intros. Keep say "" and intros [].',
       'The "play" array must contain 2-3 songs in "song title - artist" format. Keep original-language titles/artists for search.',
-      'The "segments" array must contain 3-5 cold_open segments for play[0], each one sentence, position before_track, trackIndex 0, groupId "open_0".',
+      'The "segments" array must contain 2-4 cold_open segments for play[0], each one sentence, position before_track, trackIndex 0, groupId "open_0".',
       'Do not repeat any song from the recent play history or current queue. Do not include the same song twice in one play array.',
       'Avoid artists that appear in the most recent 5 played songs unless the listener explicitly asked for that artist.',
       'Use dynamic DJ memory as taste and tone guidance, but do not mention the memory system.',
@@ -169,44 +169,6 @@ function buildProgramStartPrompt(userInput, queueState = '', options = {}) {
       coldOpenLengthInstruction(djLanguage),
       'Do not say "This is Claudio", "coming up next", "let me", "okay", or explain that you are generating a program.',
       '{"title":"program moment name","say":"","play":["song - artist","song - artist"],"segments":[{"type":"cold_open","groupId":"open_0","part":"anchor","position":"before_track","trackIndex":0,"text":"One sentence about play[0]."},{"type":"cold_open","groupId":"open_0","part":"turn","position":"before_track","trackIndex":0,"text":"One sentence that develops the opening."},{"type":"cold_open","groupId":"open_0","part":"invitation","position":"before_track","trackIndex":0,"text":"One short sentence into the first track."}],"intros":[],"reason":"internal reason","mode":"program_start"}',
-    ].join('\n'),
-  ].filter(Boolean).join('\n\n');
-}
-
-function buildOpeningLeadInPrompt({ programTitle = '', firstTrack = null, userInput = '', djLanguage = 'en', hostMode = 'story', userIntent = '', musicRequest = null, programArc = null, correctionContext = null, seed = '' } = {}) {
-  const normalizedLanguage = normalizeDjLanguage(djLanguage);
-  const normalizedHostMode = normalizeHostMode(hostMode);
-  const intentDetails = intentDetailText({ userIntent, musicRequest });
-  const arcDetails = programArcText({ programArc });
-  const correctionDetails = correctionText({ correctionContext });
-  const firstTrackText = firstTrack
-    ? `${firstTrack.title || firstTrack.query}${firstTrack.artist ? ' — ' + firstTrack.artist : ''}`
-    : 'unknown first track';
-
-  return [
-    sharedContext({ includeDialog: true, recentPlayLimit: 10 }),
-    `# 电台任务\nopening_lead_in：为已经确认可播放的第一首歌写 cold open 的第一句。`,
-    programTitle ? `# 当前节目标题\n${programTitle}` : '',
-    intentDetails ? `# 意图细节\n${intentDetails}` : '',
-    arcDetails ? `# 当前节目弧线\n${arcDetails}` : '',
-    correctionDetails ? `# 纠错上下文\n${correctionDetails}` : '',
-    userInput ? `# 用户输入 / 启动意图\n${userInput}` : '',
-    seed ? `# program_start 给出的开场种子\n${seed}` : '',
-    `# 第一首已确认可播放歌曲\n${firstTrackText}`,
-    [
-      'Strictly output JSON only, with no extra text.',
-      'Return only: {"segment":{"type":"cold_open","groupId":"open_0","part":"lead_in","position":"before_track","trackIndex":0,"text":"..."}, "reason":"internal reason"}.',
-      djLanguageInstruction(normalizedLanguage, 'lead-in text'),
-      hostModeInstruction(normalizedHostMode),
-      'Write exactly one sentence.',
-      normalizedLanguage === 'zh'
-        ? 'Keep it 15-36 Chinese characters unless a song title requires more.'
-        : 'Keep it 8-18 English words unless a song title requires more.',
-      'It must feel like a live DJ taking the mic before the first track, not a template, slogan, assistant reply, or station ID.',
-      'It is the first sentence of a longer cold open; leave room for later detail.',
-      'Do not say "This is Claudio", "coming up next", "let me", "okay", "alright", or explain the queue.',
-      'If you mention a song title or artist, it must exactly match the confirmed first track above.',
-      '{"segment":{"type":"cold_open","groupId":"open_0","part":"lead_in","position":"before_track","trackIndex":0,"text":"One short first line."},"reason":"internal reason"}',
     ].join('\n'),
   ].filter(Boolean).join('\n\n');
 }
@@ -246,7 +208,7 @@ function buildColdOpenForTracksPrompt({ programTitle = '', tracks = [], userInpu
       'If you mention a song title or artist, it must exactly be from the confirmed playable song list above.',
       'Do not mention or describe any song that is not in the confirmed playable song list.',
       'The "segments" array must contain only cold_open segments for trackIndex 0.',
-      'Write 3-5 consecutive cold_open segments, each one sentence, same position before_track and trackIndex 0.',
+      'Write 2-4 consecutive cold_open segments, each one sentence, same position before_track and trackIndex 0.',
       directRequest
         ? 'This is a direct listener request with the song already resolved. Do not plan a broader set; focus on why this exact confirmed song fits the request.'
         : 'Keep the opening connected to the broader program arc without drifting away from the first confirmed track.',
@@ -309,11 +271,11 @@ function buildBridgePrompt({ programTitle = '', afterTrack, beforeTrack, afterTr
       'For bridge segments, use the same groupId, position between_tracks, and exact afterTrackIndex/beforeTrackIndex provided.',
       bridgeLengthInstruction(normalizedLanguage),
       'Allowed bridge part values: back_announce, pivot, handoff.',
-      'Do not write a recommendation explanation. This is live radio at the seam.',
+      'Do not write a recommendation explanation. This is a live radio transition.',
       'If there is nothing worth saying, return one silence segment with text "".',
       `{"segments":[{"type":"bridge","groupId":"bridge_${afterTrackIndex}_${beforeTrackIndex}","part":"back_announce","position":"between_tracks","afterTrackIndex":${afterTrackIndex},"beforeTrackIndex":${beforeTrackIndex},"text":"One sentence."},{"type":"bridge","groupId":"bridge_${afterTrackIndex}_${beforeTrackIndex}","part":"handoff","position":"between_tracks","afterTrackIndex":${afterTrackIndex},"beforeTrackIndex":${beforeTrackIndex},"text":"One sentence into the next track."}],"reason":"internal reason"}`,
     ].join('\n'),
   ].filter(Boolean).join('\n\n');
 }
 
-module.exports = { buildPrompt, buildProgramStartPrompt, buildOpeningLeadInPrompt, buildColdOpenForTracksPrompt, buildMusicRefillPrompt, buildBridgePrompt };
+module.exports = { buildPrompt, buildProgramStartPrompt, buildColdOpenForTracksPrompt, buildMusicRefillPrompt, buildBridgePrompt };

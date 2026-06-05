@@ -6,6 +6,7 @@ const DEFAULT_TIMEOUT_MS = 10000;
 const DEFAULT_CACHE_TTL_MS = 15 * 60 * 1000;
 const DEFAULT_NEGATIVE_CACHE_TTL_MS = 2 * 60 * 1000;
 const DEFAULT_CACHE_MAX_ENTRIES = 200;
+const DEFAULT_SEARCH_LIMIT = 10;
 
 let cachedToken = null;
 const lookupCache = new Map();
@@ -142,6 +143,54 @@ function normalizeSearchText(value) {
     .trim();
 }
 
+function canonicalSearchText(value) {
+  return normalizeSearchText(value)
+    .replace(/\b(feat|ft|featuring)\b.*$/i, '')
+    .replace(/\b\d{2,4}\s*(remaster(?:ed)?|remix|mix|version)\b/gi, '')
+    .replace(/\b(remaster(?:ed)?|remix|mix|version|edit|mono|stereo|deluxe|expanded|bonus|anniversary)\b/gi, '')
+    .replace(/\b(live|acoustic|karaoke|instrumental|sped up|slowed|nightcore)\b/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function stripParentheticalNoise(value) {
+  return String(value || '')
+    .replace(/\s*[\[(（【].*?[\])）】]\s*/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function significantTokens(value) {
+  return normalizeSearchText(value)
+    .split(' ')
+    .filter(token => token.length > 1 || hasCjk(token));
+}
+
+function uniqueValues(values) {
+  return [...new Set(values.map(value => String(value || '').trim()).filter(Boolean))];
+}
+
+function searchLimit() {
+  return Math.max(1, Math.min(20, Number(process.env.SPOTIFY_SEARCH_LIMIT || DEFAULT_SEARCH_LIMIT)));
+}
+
+function buildSearchQueries(query, { title, artist }) {
+  const cleanedTitle = stripParentheticalNoise(title);
+  const cleanedArtist = stripParentheticalNoise(artist);
+  const queries = [];
+  if (title && artist) {
+    queries.push(`track:${title} artist:${artist}`);
+    if (cleanedTitle !== title || cleanedArtist !== artist) {
+      queries.push(`track:${cleanedTitle || title} artist:${cleanedArtist || artist}`);
+    }
+    queries.push(`${title} ${artist}`);
+    queries.push(`${artist} ${title}`);
+  }
+  if (cleanedTitle && cleanedTitle !== title) queries.push(cleanedArtist ? `${cleanedTitle} ${cleanedArtist}` : cleanedTitle);
+  queries.push(query);
+  return uniqueValues(queries);
+}
+
 function withTimeout(timeoutMs = DEFAULT_TIMEOUT_MS) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -250,16 +299,13 @@ async function searchSpotify(query) {
 
 async function searchSpotifyUncached(query, market) {
   const { title, artist } = splitQuery(query);
-  const searches = [];
-
-  if (title && artist) searches.push(`track:${title} artist:${artist}`);
-  searches.push(query);
+  const searches = buildSearchQueries(query, { title, artist });
 
   for (const q of searches) {
     const data = await spotifyGet('/search', {
       q,
       type: 'track',
-      limit: 5,
+      limit: searchLimit(),
       market,
       include_external: 'audio',
     });
@@ -275,6 +321,8 @@ function chooseBestTrack(items, request) {
   if (!items.length) return null;
   const requestedTitle = normalizeSearchText(request.title || request.query);
   const requestedArtist = normalizeSearchText(request.artist);
+  const requestedCanonicalTitle = canonicalSearchText(stripParentheticalNoise(request.title || request.query));
+  const requestedVersionWords = versionWords(request.title || request.query);
   let best = null;
   let bestScore = -1;
 
@@ -283,17 +331,22 @@ function chooseBestTrack(items, request) {
     if (!track) continue;
     const title = normalizeSearchText(track.title);
     const artists = normalizeSearchText(track.artist);
-    const titleScore = titleMatchScore(requestedTitle, title);
+    const canonicalTitle = canonicalSearchText(stripParentheticalNoise(track.title));
+    const titleScore = Math.max(
+      titleMatchScore(requestedTitle, title),
+      titleMatchScore(requestedCanonicalTitle, canonicalTitle)
+    );
     const artistScore = artistMatchScore(requestedArtist, artists);
-    let score = titleScore + artistScore;
+    let score = titleScore + artistScore + popularityScore(item.popularity);
     if (track.spotifyUri) score += 1;
+    score -= versionPenalty(requestedVersionWords, track.title, track.album);
     if (score > bestScore) {
       best = track;
       bestScore = score;
     }
   }
 
-  const requiredScore = requestedArtist ? 80 : 55;
+  const requiredScore = requestedArtist ? 85 : 60;
   return bestScore >= requiredScore ? best : null;
 }
 
@@ -302,10 +355,10 @@ function titleMatchScore(requestedTitle, title) {
   if (title === requestedTitle) return 120;
   if (phraseContains(title, requestedTitle)) return 95;
   if (title.length >= 2 && phraseContains(requestedTitle, title)) return 80;
-  const requestedTokens = requestedTitle.split(' ').filter(Boolean);
-  const titleTokens = title.split(' ').filter(Boolean);
+  const requestedTokens = significantTokens(requestedTitle);
+  const titleTokens = significantTokens(title);
   if (!requestedTokens.length || !titleTokens.length) return 0;
-  const overlap = requestedTokens.filter(token => titleTokens.includes(token)).length;
+  const overlap = requestedTokens.filter(token => titleTokens.some(candidate => tokenMatches(token, candidate))).length;
   const ratio = overlap / Math.max(requestedTokens.length, 1);
   if (ratio >= 0.8) return 70;
   if (ratio >= 0.5) return 45;
@@ -328,7 +381,59 @@ function artistMatchScore(requestedArtist, artists) {
   if (!artists) return 0;
   if (artists === requestedArtist) return 90;
   if (artists.includes(requestedArtist) || requestedArtist.includes(artists)) return 80;
+  const requestedTokens = significantTokens(requestedArtist);
+  const artistTokens = significantTokens(artists);
+  if (!requestedTokens.length || !artistTokens.length) return 0;
+  const overlap = requestedTokens.filter(token => artistTokens.some(candidate => tokenMatches(token, candidate))).length;
+  const ratio = overlap / requestedTokens.length;
+  if (ratio >= 0.9) return 76;
+  if (ratio >= 0.6) return 52;
   return 0;
+}
+
+function tokenMatches(requested, candidate) {
+  if (!requested || !candidate) return false;
+  if (requested === candidate) return true;
+  if (hasCjk(requested) || hasCjk(candidate)) return candidate.includes(requested) || requested.includes(candidate);
+  return requested.length >= 4 && candidate.startsWith(requested);
+}
+
+function popularityScore(popularity) {
+  const value = Number(popularity || 0);
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.min(8, value / 12);
+}
+
+function versionWords(value) {
+  const text = normalizeSearchText(value);
+  const words = new Set();
+  ['live', 'acoustic', 'remix', 'remaster', 'remastered', 'karaoke', 'instrumental'].forEach(word => {
+    if (text.includes(word)) words.add(word.replace(/ed$/, ''));
+  });
+  return words;
+}
+
+function versionPenalty(requestedVersionWords, title, album) {
+  const text = normalizeSearchText(`${title || ''} ${album || ''}`);
+  let penalty = 0;
+  const noisy = [
+    ['live', 32],
+    ['karaoke', 42],
+    ['instrumental', 34],
+    ['tribute', 42],
+    ['cover', 28],
+    ['sped up', 24],
+    ['slowed', 24],
+    ['nightcore', 30],
+    ['remix', 22],
+    ['remaster', 4],
+    ['remastered', 4],
+  ];
+  for (const [word, cost] of noisy) {
+    const requested = requestedVersionWords.has(word.replace(/ed$/, ''));
+    if (!requested && text.includes(word)) penalty += cost;
+  }
+  return penalty;
 }
 
 async function getArtistTracks(query, count = 3) {

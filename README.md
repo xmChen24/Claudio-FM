@@ -133,8 +133,11 @@ MUSIC_FALLBACK_PROVIDER=none
 MUSIC_LOOKUP_CACHE_TTL_MS=900000
 MUSIC_NEGATIVE_CACHE_TTL_MS=120000
 MUSIC_LOOKUP_CACHE_MAX_ENTRIES=200
+SPOTIFY_SEARCH_LIMIT=10
 SCHEDULER_INTERRUPT_ACTIVE_PROGRAM=0
 SPOTIFY_FAST_START=1
+PROGRAM_START_QUICK_OPEN=1
+BRIDGE_LLM_ENABLED=1
 TTS_SYNTH_CONCURRENCY=3
 TTS_SYNTH_RETRIES=2
 ```
@@ -143,8 +146,10 @@ Track lookup and TTS synthesis run with small bounded concurrency. Result orderi
 By default, Claudio uses Spotify Web Playback URI fast-start and does not invoke yt-dlp. Set `MUSIC_FALLBACK_PROVIDER=yt-dlp` and `SPOTIFY_FAST_START=0` only when you explicitly want stream-url fallback.
 Direct artist requests such as `Drake` or `play Drake songs` search Spotify track results and enqueue up to `DIRECT_ARTIST_TRACK_COUNT` tracks whose artist field matches the requested artist. Short CJK unknown requests and uppercase bare track names such as `HUMBLE` try song-title search first, then fall back to artist search.
 Spotify lookup results are cached in memory using `MUSIC_LOOKUP_CACHE_TTL_MS`; misses use the shorter `MUSIC_NEGATIVE_CACHE_TTL_MS`, and the cache is capped by `MUSIC_LOOKUP_CACHE_MAX_ENTRIES`.
+Spotify search now considers up to `SPOTIFY_SEARCH_LIMIT` candidates per query variant and scores title, artist, version noise, and popularity before accepting a result.
 Scheduled shows use the same `program_start` path as listener starts. By default they do not interrupt an active program; set `SCHEDULER_INTERRUPT_ACTIVE_PROGRAM=1` to allow scheduled retunes.
-At startup, Claudio now resolves the first playable track quickly, then waits for the full cold open script and TTS before starting the first song. Remaining startup tracks continue resolving in the background.
+At startup, Claudio resolves the first playable track with bounded parallel candidate lookup, speaks one short confirmed-track opening line, and starts the first song while the full cold open continuation, remaining tracks, and bridge segments continue in the background. Set `PROGRAM_START_QUICK_OPEN=0` to restore the older fully-blocking opening path.
+Bridge segments use the LLM by default; if bridge writing fails or `BRIDGE_LLM_ENABLED=0`, Claudio falls back to a short local handoff or intentional silence instead of leaving a failed background job.
 
 Start Claudio:
 
