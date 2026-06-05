@@ -333,6 +333,14 @@ function normalizeHostMode(value) {
   return ['quiet', 'story', 'companion'].includes(value) ? value : 'story';
 }
 
+function normalizeMusicProvider(value) {
+  return value === 'spotify' ? 'spotify' : '';
+}
+
+function payloadMusicProvider(value) {
+  return normalizeMusicProvider(value) || 'spotify';
+}
+
 function ensureDirForFile(filePath) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
 }
@@ -1077,7 +1085,7 @@ async function resolveRequestedTracks(requestedTracks, options = {}) {
 
   const resolved = await mapWithConcurrency(requestedTracks, MUSIC_RESOLVE_CONCURRENCY, async (query, i) => {
     try {
-      return { i, query, track: await getTrack(query) };
+      return { i, query, track: await getTrack(query, { provider: options.musicProvider }) };
     } catch (err) {
       console.warn(`[音乐] ✗ ${i + 1}/${requestedTracks.length} 解析失败: ${query} | ${err.message}`);
       return { i, query, track: null };
@@ -1116,9 +1124,9 @@ async function resolveRequestedTracks(requestedTracks, options = {}) {
   return { tracks, failedTracks };
 }
 
-async function lookupPlayableCandidate(query, i, avoidState, enforceAvoidance) {
+async function lookupPlayableCandidate(query, i, avoidState, enforceAvoidance, musicProvider = '') {
   try {
-    const track = await getTrack(query);
+    const track = await getTrack(query, { provider: musicProvider });
     if (!track?.streamUrl && !track?.spotifyUri) {
       return { i, query, failedTracks: [query], track: null };
     }
@@ -1194,7 +1202,7 @@ async function resolveFirstPlayableTrack(requestedTracks, options = {}) {
       while (!settled && active < concurrency && nextIndex < requested.length) {
         const i = nextIndex++;
         active++;
-        lookupPlayableCandidate(requested[i], i, avoidState, enforceAvoidance)
+        lookupPlayableCandidate(requested[i], i, avoidState, enforceAvoidance, options.musicProvider)
           .then(result => { results[i] = result; })
           .catch(err => {
             results[i] = { i, query: requested[i], failedTracks: [`${requested[i]} (${err.message})`], track: null };
@@ -1212,13 +1220,13 @@ async function resolveFirstPlayableTrack(requestedTracks, options = {}) {
   });
 }
 
-async function resolveDirectMusicRequest(request = {}) {
+async function resolveDirectMusicRequest(request = {}, options = {}) {
   const failedTracks = [];
   const rawQuery = String(request.query || request.title || request.artist || '').trim();
   if (!rawQuery) return { tracks: [], failedTracks: ['empty direct request'], requestType: 'unknown' };
 
   if (request.kind === 'artist') {
-    const tracks = await resolveArtistRequest(request.artist || rawQuery);
+    const tracks = await resolveArtistRequest(request.artist || rawQuery, options);
     if (tracks.length) return { tracks, failedTracks, requestType: 'artist' };
     failedTracks.push(`${rawQuery} (artist not found)`);
     return { tracks: [], failedTracks, requestType: 'artist' };
@@ -1232,19 +1240,19 @@ async function resolveDirectMusicRequest(request = {}) {
   if (request.kind === 'unknown') {
     if (shouldTryUnknownAsTrackFirst(request, rawQuery)) {
       triedTrackFirst = true;
-      const direct = await resolveSingleTrackRequest(trackQuery, request, failedTracks);
+      const direct = await resolveSingleTrackRequest(trackQuery, request, failedTracks, options);
       if (direct.tracks.length) return direct;
     }
-    const artistTracks = await resolveArtistRequest(rawQuery);
+    const artistTracks = await resolveArtistRequest(rawQuery, options);
     if (artistTracks.length) return { tracks: artistTracks, failedTracks, requestType: 'artist' };
     if (triedTrackFirst) return { tracks: [], failedTracks, requestType: 'track' };
   }
 
-  return resolveSingleTrackRequest(trackQuery, request, failedTracks);
+  return resolveSingleTrackRequest(trackQuery, request, failedTracks, options);
 }
 
-async function resolveSingleTrackRequest(trackQuery, request, failedTracks) {
-  const track = await getTrack(trackQuery);
+async function resolveSingleTrackRequest(trackQuery, request, failedTracks, options = {}) {
+  const track = await getTrack(trackQuery, { provider: options.musicProvider });
   if (!track?.streamUrl && !track?.spotifyUri) {
     failedTracks.push(`${trackQuery} (track not found)`);
     return { tracks: [], failedTracks, requestType: 'track' };
@@ -1266,7 +1274,7 @@ async function resolveSingleTrackRequest(trackQuery, request, failedTracks) {
 async function resolveArtistRequest(artist, options = {}) {
   const artistName = String(artist || '').trim();
   if (!artistName) return [];
-  const resolved = await getArtistTracks(artistName, DIRECT_ARTIST_TRACK_COUNT, options);
+  const resolved = await getArtistTracks(artistName, DIRECT_ARTIST_TRACK_COUNT, { provider: options.musicProvider });
   const tracks = resolved
     .filter(track => track?.streamUrl || track?.spotifyUri)
     .map(track => payloadTrackFromResolved(
@@ -1427,7 +1435,7 @@ async function runJob(job) {
   throw new Error(`Unknown job type: ${job.type}`);
 }
 
-function enqueueBridgeJobs({ programId, sessionTitle, tracks, startIndex = 0, previousTrack = null, previousIndex = null, djLanguage = 'en', hostMode = 'story' }) {
+function enqueueBridgeJobs({ programId, sessionTitle, tracks, startIndex = 0, previousTrack = null, previousIndex = null, djLanguage = 'en', hostMode = 'story', musicProvider = '' }) {
   if (previousTrack && tracks.length) {
     enqueueJob({
       type: 'bridge_generation',
@@ -1441,6 +1449,7 @@ function enqueueBridgeJobs({ programId, sessionTitle, tracks, startIndex = 0, pr
       programArc: stationState.programArc,
       djLanguage: normalizeDjLanguage(djLanguage),
       hostMode: normalizeHostMode(hostMode),
+      musicProvider: normalizeMusicProvider(musicProvider),
     });
   }
   for (let i = 1; i < tracks.length; i++) {
@@ -1456,6 +1465,7 @@ function enqueueBridgeJobs({ programId, sessionTitle, tracks, startIndex = 0, pr
       programArc: stationState.programArc,
       djLanguage: normalizeDjLanguage(djLanguage),
       hostMode: normalizeHostMode(hostMode),
+      musicProvider: normalizeMusicProvider(musicProvider),
     });
   }
 }
@@ -1469,6 +1479,7 @@ function enqueueProgramStartJob({
   hostMode = 'story',
   musicRequest = null,
   correctionContext = null,
+  musicProvider = '',
   keyPrefix = 'program_start',
 }) {
   return enqueueJob({
@@ -1482,6 +1493,7 @@ function enqueueProgramStartJob({
     hostMode: normalizeHostMode(hostMode),
     musicRequest,
     correctionContext,
+    musicProvider: normalizeMusicProvider(musicProvider),
   });
 }
 
@@ -1509,6 +1521,7 @@ async function enqueueScheduledProgramStart(userInput, intent = {}) {
     djLanguage: intent.djLanguage,
     hostMode: intent.hostMode,
     musicRequest: intent.musicRequest || null,
+    musicProvider: intent.musicProvider,
   });
   return { queued: accepted, jobType: 'program_start', source: 'scheduler' };
 }
@@ -1528,7 +1541,7 @@ async function runProgramStartJob(job) {
   let directRequestFailed = false;
   if (job.musicRequest) {
     broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'phase', phase: 'resolve_audio' });
-    const direct = await resolveDirectMusicRequest(job.musicRequest);
+    const direct = await resolveDirectMusicRequest(job.musicRequest, { musicProvider: job.musicProvider });
     tracks = direct.tracks;
     failedTracks = direct.failedTracks;
     timing.mark('direct_resolve_audio_ms');
@@ -1568,7 +1581,7 @@ async function runProgramStartJob(job) {
     }
 
     broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'phase', phase: 'resolve_audio' });
-    const resolved = await resolveFirstPlayableTrack(result.play || []);
+    const resolved = await resolveFirstPlayableTrack(result.play || [], { musicProvider: job.musicProvider });
     tracks = resolved.tracks;
     failedTracks = [...failedTracks, ...resolved.failedTracks];
     remainingPlay = resolved.remainingPlay;
@@ -1577,7 +1590,7 @@ async function runProgramStartJob(job) {
   if (!tracks.length && !directRequestFailed) {
     console.warn('[program_start] No playable tracks from generated set; using fallback set.');
     const fallbackResult = fallbackProgramStartResult(job, 'no playable generated tracks');
-    const fallbackResolved = await resolveFirstPlayableTrack(fallbackResult.play, { enforceAvoidance: false });
+    const fallbackResolved = await resolveFirstPlayableTrack(fallbackResult.play, { enforceAvoidance: false, musicProvider: job.musicProvider });
     if (fallbackResolved.tracks.length) {
       result = fallbackResult;
       tracks = fallbackResolved.tracks;
@@ -1630,6 +1643,7 @@ async function runProgramStartJob(job) {
     const payload = {
       type: 'program-start',
       programId,
+      musicProvider: payloadMusicProvider(job.musicProvider),
       tracks,
       segments: opening.segments,
       sessionTitle: result.title || '',
@@ -1661,6 +1675,7 @@ async function runProgramStartJob(job) {
         musicRequest: job.musicRequest,
         djLanguage: job.djLanguage,
         hostMode: job.hostMode,
+        musicProvider: job.musicProvider,
       });
     }
 
@@ -1676,9 +1691,10 @@ async function runProgramStartJob(job) {
         previousIndex: tracks.length - 1,
         djLanguage: job.djLanguage,
         hostMode: job.hostMode,
+        musicProvider: job.musicProvider,
       });
     }
-    enqueueBridgeJobs({ programId, sessionTitle: result.title || '', tracks, startIndex: 0, djLanguage: job.djLanguage, hostMode: job.hostMode });
+    enqueueBridgeJobs({ programId, sessionTitle: result.title || '', tracks, startIndex: 0, djLanguage: job.djLanguage, hostMode: job.hostMode, musicProvider: job.musicProvider });
     return payload;
   }
 
@@ -1706,6 +1722,7 @@ async function runProgramStartJob(job) {
   const payload = {
     type: 'program-start',
     programId,
+    musicProvider: payloadMusicProvider(job.musicProvider),
     tracks,
     segments,
     sessionTitle: coldOpenResult.title || '',
@@ -1865,7 +1882,7 @@ async function runMusicTailResolveJob(job) {
   const startIndex = stationState.tracks.length;
   const previousTrack = job.previousTrack || stationState.tracks[startIndex - 1] || null;
   const previousIndex = Number.isInteger(job.previousIndex) ? job.previousIndex : startIndex - 1;
-  const { tracks, failedTracks } = await resolveRequestedTracks(job.play || [], { queue: stationState.tracks });
+  const { tracks, failedTracks } = await resolveRequestedTracks(job.play || [], { queue: stationState.tracks, musicProvider: job.musicProvider });
   timing.mark('resolve_audio_ms');
   if (isStaleProgramJob(job)) {
     console.log(`[music_tail_resolve] skip stale resolved tail for ${job.programId}`);
@@ -1887,6 +1904,7 @@ async function runMusicTailResolveJob(job) {
   const payload = {
     type: 'tracks-ready',
     programId,
+    musicProvider: payloadMusicProvider(job.musicProvider),
     tracks,
     startIndex,
     failedTracks,
@@ -1905,6 +1923,7 @@ async function runMusicTailResolveJob(job) {
     previousIndex,
     djLanguage: job.djLanguage,
     hostMode: job.hostMode,
+    musicProvider: job.musicProvider,
   });
   return payload;
 }
@@ -1927,7 +1946,7 @@ async function runMusicRefillJob(job) {
   });
   const result = await callRadioLlm(prompt, 'music_refill');
   timing.mark('choose_tracks_ms');
-  const { tracks, failedTracks } = await resolveRequestedTracks(result.play || [], { queue });
+  const { tracks, failedTracks } = await resolveRequestedTracks(result.play || [], { queue, musicProvider: job.musicProvider });
   timing.mark('resolve_audio_ms');
   if (isStaleProgramJob(job)) {
     console.log(`[music_refill] skip stale resolved refill for ${job.programId}`);
@@ -1948,6 +1967,7 @@ async function runMusicRefillJob(job) {
   const payload = {
     type: 'tracks-ready',
     programId,
+    musicProvider: payloadMusicProvider(job.musicProvider),
     tracks,
     startIndex,
     failedTracks,
@@ -1956,7 +1976,7 @@ async function runMusicRefillJob(job) {
     metrics: timing.snapshot(),
   };
   broadcast(payload);
-  enqueueBridgeJobs({ programId, sessionTitle: stationState.sessionTitle, tracks, startIndex, previousTrack, previousIndex, djLanguage: job.djLanguage, hostMode: job.hostMode });
+  enqueueBridgeJobs({ programId, sessionTitle: stationState.sessionTitle, tracks, startIndex, previousTrack, previousIndex, djLanguage: job.djLanguage, hostMode: job.hostMode, musicProvider: job.musicProvider });
   return payload;
 }
 
@@ -2048,7 +2068,7 @@ async function runRadioSegment(userInput, intent = {}, skipHistory = false) {
   if (result.say) console.log(`[电台] 兼容旁白: "${result.say.slice(0, 100)}${result.say.length > 100 ? '…' : ''}"`);
 
   const requestedTracks = speechOnly ? [] : (result.play || []);
-  const { tracks, failedTracks } = await resolveRequestedTracks(requestedTracks);
+  const { tracks, failedTracks } = await resolveRequestedTracks(requestedTracks, { musicProvider: intent.musicProvider });
 
   const segments = await synthesizeSegments(normalizeSegments(result, tracks, speechOnly, failedTracks));
   applyLegacyTrackIntrosFromSegments(tracks, segments);
@@ -2064,6 +2084,7 @@ async function runRadioSegment(userInput, intent = {}, skipHistory = false) {
 
   const payload = {
     type: 'now-playing',
+    musicProvider: payloadMusicProvider(intent.musicProvider),
     ttsUrl,
     tracks,
     segments,
@@ -2098,7 +2119,7 @@ async function handleClaudeRequest(userInput, res, intent = {}, skipHistory = fa
 
 // ── HTTP Routes ──────────────────────────────────────────────────────────────
 app.post('/api/chat', async (req, res) => {
-  const { message, autoRefill, autoStart, djLanguage, hostMode } = req.body;
+  const { message, autoRefill, autoStart, djLanguage, hostMode, musicProvider } = req.body;
   if (!message) return res.status(400).json({ error: 'message required' });
 
   const intent = route(message);
@@ -2110,6 +2131,7 @@ app.post('/api/chat', async (req, res) => {
   intent.source = requestSource;
   intent.djLanguage = normalizeDjLanguage(djLanguage);
   intent.hostMode = normalizeHostMode(hostMode);
+  intent.musicProvider = normalizeMusicProvider(musicProvider);
   if (autoStart) {
     intent.mode = 'music';
     intent.userIntent = 'vibe_request';
@@ -2157,6 +2179,7 @@ app.post('/api/chat', async (req, res) => {
         hostMode: intent.hostMode,
         musicRequest: null,
         correctionContext,
+        musicProvider: intent.musicProvider,
       });
       return res.json({ queued: accepted, jobType: 'program_start', correction: true });
     }
@@ -2182,6 +2205,7 @@ app.post('/api/chat', async (req, res) => {
       hostMode: intent.hostMode,
       musicRequest: intent.musicRequest || null,
       correctionContext: null,
+      musicProvider: intent.musicProvider,
     });
     return res.json({ queued: accepted, jobType: 'program_start', autoStart: !!autoStart });
   }
@@ -2200,6 +2224,7 @@ app.post('/api/radio/refill', (req, res) => {
     queueLength,
     djLanguage,
     hostMode,
+    musicProvider,
   } = req.body || {};
   const effectiveProgramId = programId || stationState.programId || makeProgramId();
   const effectiveQueueLength = Number.isInteger(queueLength) ? queueLength : Array.isArray(queue) ? queue.length : stationState.tracks.length;
@@ -2217,6 +2242,7 @@ app.post('/api/radio/refill', (req, res) => {
     count: REFILL_TRACK_COUNT,
     djLanguage: normalizeDjLanguage(djLanguage),
     hostMode: normalizeHostMode(hostMode),
+    musicProvider: normalizeMusicProvider(musicProvider),
   });
   res.json({ queued: accepted, jobType: 'music_refill', programId: effectiveProgramId });
 });

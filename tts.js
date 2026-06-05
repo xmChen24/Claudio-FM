@@ -14,14 +14,28 @@ function md5(text) {
 
 function audioFormatForProvider(provider, options = {}) {
   if (provider === 'kokoro') return options.format || process.env.KOKORO_RESPONSE_FORMAT || 'wav';
+  if (provider === 'cosyvoice') return options.format || process.env.COSYVOICE_RESPONSE_FORMAT || 'wav';
   return options.format || process.env.VOLCENGINE_TTS_FORMAT || 'mp3';
+}
+
+function ttsVolumeGain(provider, options = {}) {
+  const explicit = Number(options.volumeGain);
+  if (Number.isFinite(explicit) && explicit > 0) return explicit;
+  if (options.role === 'caller') {
+    const callerGain = Number(process.env.CALLER_TTS_VOLUME_GAIN || 1);
+    return Number.isFinite(callerGain) && callerGain > 0 ? callerGain : 1;
+  }
+  const gain = Number(process.env.DJ_TTS_VOLUME_GAIN || process.env.TTS_VOLUME_GAIN || 1.3);
+  return Number.isFinite(gain) && gain > 0 ? gain : 1;
 }
 
 function cachePath(text, provider = process.env.TTS_PROVIDER || 'volcengine', options = {}) {
   const voice = getVoiceForProvider(provider, options);
   const role = options.role || 'station';
   const format = audioFormatForProvider(provider, options).replace(/[^a-z0-9]/gi, '') || 'mp3';
-  return path.join(CACHE_DIR, `${md5(`${role}:${provider}:${voice}:${format}:${text}`)}.${format}`);
+  const gain = format === 'wav' ? ttsVolumeGain(provider, options) : 1;
+  const gainKey = gain === 1 ? '' : `:wavgain=v2:${gain.toFixed(3)}`;
+  return path.join(CACHE_DIR, `${md5(`${role}:${provider}:${voice}:${format}${gainKey}:${text}`)}.${format}`);
 }
 
 function synthesize(text, options = {}) {
@@ -41,6 +55,8 @@ function synthesize(text, options = {}) {
     promise = synthesizeVolcengine(text, cached, options);
   } else if (provider === 'fish') {
     promise = synthesizeFish(text, cached, options);
+  } else if (provider === 'cosyvoice') {
+    promise = synthesizeCosyVoice(text, cached, options);
   } else {
     promise = synthesizeKokoro(text, cached, options);
   }
@@ -109,7 +125,92 @@ async function warmup(options = {}) {
 function getVoiceForProvider(provider, options = {}) {
   if (provider === 'fish') return options.voiceId || process.env.FISH_VOICE_ID || '';
   if (provider === 'volcengine') return options.voiceType || process.env.VOLCENGINE_TTS_VOICE_TYPE || '';
+  if (provider === 'cosyvoice') return options.spkId || options.voice || process.env.COSYVOICE_SPK_ID || '';
   return options.voice || process.env.KOKORO_VOICE || '';
+}
+
+function wavBufferFromPcm16(buffer, sampleRate = 22050, channels = 1) {
+  const dataSize = buffer.length;
+  const header = Buffer.alloc(44);
+  const byteRate = sampleRate * channels * 2;
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + dataSize, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(channels * 2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(dataSize, 40);
+  return Buffer.concat([header, buffer]);
+}
+
+function applyWavVolumeGain(buffer, gain = 1) {
+  if (!Number.isFinite(gain) || gain <= 0 || Math.abs(gain - 1) < 0.001) return buffer;
+  if (buffer.length < 44) return buffer;
+  if (buffer.toString('ascii', 0, 4) !== 'RIFF' || buffer.toString('ascii', 8, 12) !== 'WAVE') return buffer;
+
+  let fmt = null;
+  let dataStart = -1;
+  let dataSize = 0;
+  let offset = 12;
+  while (offset + 8 <= buffer.length) {
+    const chunkId = buffer.toString('ascii', offset, offset + 4);
+    const chunkSize = buffer.readUInt32LE(offset + 4);
+    const chunkStart = offset + 8;
+    if (chunkStart + chunkSize > buffer.length) break;
+    if (chunkId === 'fmt ' && chunkSize >= 16) {
+      fmt = {
+        audioFormat: buffer.readUInt16LE(chunkStart),
+        bitsPerSample: buffer.readUInt16LE(chunkStart + 14),
+      };
+    } else if (chunkId === 'data') {
+      dataStart = chunkStart;
+      dataSize = chunkSize;
+      break;
+    }
+    offset = chunkStart + chunkSize + (chunkSize % 2);
+  }
+
+  if (!fmt || dataStart < 0 || dataSize <= 0) return buffer;
+
+  const out = Buffer.from(buffer);
+  const dataEnd = Math.min(out.length, dataStart + dataSize);
+  if (fmt.audioFormat === 1 && fmt.bitsPerSample === 16) {
+    for (let i = dataStart; i + 1 < dataEnd; i += 2) {
+      const sample = out.readInt16LE(i);
+      const boosted = Math.max(-32768, Math.min(32767, Math.round(sample * gain)));
+      out.writeInt16LE(boosted, i);
+    }
+    return out;
+  }
+
+  if (fmt.audioFormat === 3 && fmt.bitsPerSample === 32) {
+    for (let i = dataStart; i + 3 < dataEnd; i += 4) {
+      const sample = out.readFloatLE(i);
+      if (!Number.isFinite(sample)) continue;
+      const boosted = Math.max(-1, Math.min(1, sample * gain));
+      out.writeFloatLE(boosted, i);
+    }
+    return out;
+  }
+
+  return buffer;
+}
+
+function applyTtsVolumeGain(buffer, provider, options = {}) {
+  const format = audioFormatForProvider(provider, options).replace(/[^a-z0-9]/gi, '').toLowerCase();
+  if (format !== 'wav') return buffer;
+  const gain = ttsVolumeGain(provider, options);
+  const boosted = applyWavVolumeGain(buffer, gain);
+  if (boosted !== buffer) {
+    console.log(`[TTS] 音量增益 ${gain.toFixed(2)}x (${options.role || 'station'})`);
+  }
+  return boosted;
 }
 
 function buildVolcenginePayload(text, options = {}) {
@@ -315,7 +416,39 @@ async function synthesizeKokoro(text, outPath, options = {}) {
   }
 
   const buffer = Buffer.from(await res.arrayBuffer());
-  fs.writeFileSync(outPath, buffer);
+  fs.writeFileSync(outPath, applyTtsVolumeGain(buffer, 'kokoro', options));
+  return outPath;
+}
+
+async function synthesizeCosyVoice(text, outPath, options = {}) {
+  const baseUrl = (options.baseUrl || process.env.COSYVOICE_API_BASE || 'http://127.0.0.1:50000').replace(/\/+$/, '');
+  const mode = String(options.mode || process.env.COSYVOICE_MODE || 'sft').trim().toLowerCase();
+  const spkId = options.spkId || options.voice || process.env.COSYVOICE_SPK_ID || '中文女';
+  const sampleRate = Number(options.sampleRate || process.env.COSYVOICE_SAMPLE_RATE || 22050);
+  const endpoint = mode === 'instruct' ? '/inference_instruct' : '/inference_sft';
+  const params = new URLSearchParams({
+    tts_text: text,
+    spk_id: spkId,
+  });
+  if (mode === 'instruct') {
+    params.set('instruct_text', options.instructText || process.env.COSYVOICE_INSTRUCT_TEXT || '');
+  }
+
+  const res = await fetch(`${baseUrl}${endpoint}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params,
+  });
+
+  if (!res.ok) {
+    const err = await res.text().catch(() => '');
+    throw new Error(`CosyVoice TTS error ${res.status}: ${err}`);
+  }
+
+  const pcm = Buffer.from(await res.arrayBuffer());
+  if (!pcm.length) throw new Error('CosyVoice TTS returned no audio data');
+  const wav = wavBufferFromPcm16(pcm, sampleRate);
+  fs.writeFileSync(outPath, applyTtsVolumeGain(wav, 'cosyvoice', options));
   return outPath;
 }
 

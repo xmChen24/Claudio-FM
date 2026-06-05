@@ -30,6 +30,7 @@ You can also call into the station through the request line. Claudio can play a 
 - Turns DJ lines into voice with TTS.
 - Keeps music buffered so the station can continue.
 - Lets you choose whether the DJ speaks English or Chinese.
+- Uses Spotify as the music provider.
 - Lets you control DJ voice volume and music volume separately.
 - Does not request browser location or call a weather API; the runtime context is local time and locale only.
 
@@ -81,7 +82,7 @@ VOLCENGINE_TTS_VOICE_TYPE=en_female_nadia_tips_emo_v2_mars_bigtts
 Spotify can be used for music metadata and Web Playback SDK playback. Set these values if you want Spotify support:
 
 ```bash
-MUSIC_PROVIDER=auto
+MUSIC_PROVIDER=spotify
 SPOTIFY_CLIENT_ID=your_spotify_client_id
 SPOTIFY_CLIENT_SECRET=your_spotify_client_secret
 SPOTIFY_REDIRECT_URI=http://127.0.0.1:8080/auth/spotify/callback
@@ -127,6 +128,7 @@ RADIO_CHAT_LLM_TIMEOUT_MS=90000
 TTS_WARMUP_ON_START=1
 TTS_CACHE_MAX_AGE_MS=604800000
 TTS_CACHE_MAX_FILES=600
+DJ_TTS_VOLUME_GAIN=1.3
 MUSIC_RESOLVE_CONCURRENCY=3
 DIRECT_ARTIST_TRACK_COUNT=3
 MUSIC_FALLBACK_PROVIDER=none
@@ -144,6 +146,7 @@ TTS_SYNTH_RETRIES=2
 
 Track lookup and TTS synthesis run with small bounded concurrency. Result ordering and queue de-duplication still follow the original requested track order.
 By default, Claudio uses Spotify Web Playback URI fast-start and does not invoke yt-dlp. Set `MUSIC_FALLBACK_PROVIDER=yt-dlp` and `SPOTIFY_FAST_START=0` only when you explicitly want stream-url fallback.
+The browser sends music requests to Spotify. The `musicProvider` request field remains in the radio contract for compatibility, but Claudio normalizes it to Spotify.
 Direct artist requests such as `Drake` or `play Drake songs` search Spotify track results and enqueue up to `DIRECT_ARTIST_TRACK_COUNT` tracks whose artist field matches the requested artist. Short CJK unknown requests and uppercase bare track names such as `HUMBLE` try song-title search first, then fall back to artist search.
 Spotify lookup results are cached in memory using `MUSIC_LOOKUP_CACHE_TTL_MS`; misses use the shorter `MUSIC_NEGATIVE_CACHE_TTL_MS`, and the cache is capped by `MUSIC_LOOKUP_CACHE_MAX_ENTRIES`.
 Spotify search now considers up to `SPOTIFY_SEARCH_LIMIT` candidates per query variant and scores title, artist, version noise, and popularity before accepting a result.
@@ -156,12 +159,6 @@ Start Claudio:
 ```bash
 yarn start
 ```
-
-On startup, Claudio checks the local NeteaseCloudMusicApi sidecar. If
-`NETEASE_COOKIE` is not configured and no saved local cookie exists, it creates
-a Netease QR login page at `data/netease/qr-login.html`. Scan it with the
-Netease Cloud Music app to save a local cookie for later runs. The saved cookie
-stays under `data/netease/` and is ignored by Git.
 
 The app also syncs the browser time zone and locale to `/api/environment`. That endpoint intentionally returns time context only; it does not store coordinates, browser geolocation, or weather.
 
@@ -253,6 +250,7 @@ Claudio 适合那些你不想自己整理歌单的时刻。
 - 用 TTS 把 DJ 文案转成语音。
 - 自动补歌，让电台继续播下去。
 - 支持选择 DJ 使用英文或中文播报。
+- 使用 Spotify 作为音乐来源。
 - 支持分别控制 DJ 音量和音乐音量。
 - 不请求浏览器定位，也不调用天气 API；运行上下文只使用本地时间和 locale。
 
@@ -304,7 +302,7 @@ VOLCENGINE_TTS_VOICE_TYPE=en_female_nadia_tips_emo_v2_mars_bigtts
 Spotify 可用于音乐元数据和 Web Playback SDK 播放。需要启用时填写：
 
 ```bash
-MUSIC_PROVIDER=auto
+MUSIC_PROVIDER=spotify
 SPOTIFY_CLIENT_ID=你的_Spotify_Client_ID
 SPOTIFY_CLIENT_SECRET=你的_Spotify_Client_Secret
 SPOTIFY_REDIRECT_URI=http://127.0.0.1:8080/auth/spotify/callback
@@ -350,6 +348,7 @@ RADIO_CHAT_LLM_TIMEOUT_MS=90000
 TTS_WARMUP_ON_START=1
 TTS_CACHE_MAX_AGE_MS=604800000
 TTS_CACHE_MAX_FILES=600
+DJ_TTS_VOLUME_GAIN=1.3
 MUSIC_RESOLVE_CONCURRENCY=3
 DIRECT_ARTIST_TRACK_COUNT=3
 MUSIC_FALLBACK_PROVIDER=none
@@ -363,23 +362,19 @@ TTS_SYNTH_RETRIES=2
 ```
 
 默认情况下，Claudio 使用 Spotify Web Playback URI 快速启动，不调用 yt-dlp。只有明确需要 stream URL fallback 时，才设置 `MUSIC_FALLBACK_PROVIDER=yt-dlp` 并把 `SPOTIFY_FAST_START=0`。
+浏览器会把音乐请求发送给 Spotify。`musicProvider` 请求字段仍保留在电台协议里用于兼容，但 Claudio 会统一规范化为 Spotify。
 
 歌曲解析和 TTS 合成会用小并发执行，但最终结果顺序和队列去重仍按原始请求曲目顺序处理。
 直接歌手点歌，例如 `Drake` 或 `play Drake songs`，会搜索 Spotify track 结果，并加入最多 `DIRECT_ARTIST_TRACK_COUNT` 首 artist 字段匹配该歌手的曲目。短中文未知点歌和 `HUMBLE` 这种全大写裸输入会先按歌名搜索，未命中再尝试歌手搜索。
 Spotify 搜索结果会用 `MUSIC_LOOKUP_CACHE_TTL_MS` 做内存缓存；未命中结果用较短的 `MUSIC_NEGATIVE_CACHE_TTL_MS`，总条数由 `MUSIC_LOOKUP_CACHE_MAX_ENTRIES` 限制。
 定时节目现在和用户开台走同一条 `program_start` 链路。默认不会打断活跃节目；如果需要整点强制换台，可设置 `SCHEDULER_INTERRUPT_ACTIVE_PROGRAM=1`。
-启动时，Claudio 会先快速解析第一首可播放歌曲，然后等待完整 cold open 文案和 TTS 完成，再播放第一首歌；剩余启动曲目继续在后台解析。
+启动时，Claudio 会先并发解析第一首可播放歌曲，说一句已确认首歌的短开场后开始播放；完整 cold open 续写、剩余启动曲目和 bridge 会继续在后台补齐。
 
 启动 Claudio：
 
 ```bash
 yarn start
 ```
-
-启动时，Claudio 会检查本地 NeteaseCloudMusicApi sidecar。如果没有配置
-`NETEASE_COOKIE`，也没有已保存的本地 cookie，它会生成网易云二维码登录页：
-`data/netease/qr-login.html`。用网易云音乐 App 扫码后，Claudio 会把 cookie
-保存到 `data/netease/`，后续启动自动复用；该目录会被 Git 忽略。
 
 应用还会把浏览器 time zone 和 locale 同步到 `/api/environment`。该接口只返回时间上下文，不保存坐标、浏览器定位或天气。
 

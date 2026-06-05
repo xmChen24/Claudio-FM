@@ -20,7 +20,7 @@ Core modules:
 - `program-arc.js` tracks the current set direction and energy curve.
 - `dj-correction.js` turns listener corrections into negative constraints.
 - `pwa/index.html` owns playback, voice sequencing, request line behavior,
-  refill triggers, and UI state.
+  refill triggers, Spotify provider state, and UI state.
 
 ## Request Flow
 
@@ -30,7 +30,10 @@ Core modules:
 2. Control intents broadcast immediately: next, pause, resume, volume.
 3. Explicit listener feedback updates `user/dj-memory.json` without asking the
    LLM to invent preferences.
-4. Music intents enqueue a foreground `program_start` job.
+4. Music intents enqueue a foreground `program_start` job. The browser sends
+   `musicProvider: "spotify"` and the server normalizes the provider to
+   Spotify. Once a program starts, the browser keeps refill work on that
+   program's provider field for contract compatibility.
 5. Corrections with enough context enqueue a correction-recovery `program_start`
    job.
 6. Speech-only conversation goes through `runRadioSegment` and returns an
@@ -85,10 +88,11 @@ Important WebSocket events:
 ## Frontend Playback State
 
 The browser treats `program-start` as a new show when the incoming `programId`
-differs from the current one. In that case it clears old queue state, pending DJ
-segments, TTS playback, Spotify state, and refill flags before loading the new
-program. This protects correction recovery and vibe changes from mixing old and
-new shows.
+differs from the current one. If music is already playing, it performs a spoken
+handoff: the new cold open plays over the current track with ducking, and only
+after that opening finishes does the browser clear the old queue and start the
+new program. This keeps correction recovery and vibe changes from creating a
+silent gap while still preventing old and new show state from mixing.
 
 On page load, the browser calls `/api/session` before auto-starting. If the
 server already has a complete `program-start` payload, the browser hydrates that

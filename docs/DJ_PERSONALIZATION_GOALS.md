@@ -124,7 +124,6 @@ Implemented controls:
 
 - More like this.
 - Change vibe.
-- Quiet / Story / Companion host mode.
 
 Candidate controls:
 

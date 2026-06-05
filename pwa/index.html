@@ -508,6 +508,9 @@ html, body {
   gap: 8px;
   min-width: 0;
 }
+.signal-row {
+  flex-wrap: wrap;
+}
 .signal-badge,
 .session-card,
 .up-next {
@@ -531,13 +534,6 @@ html, body {
   background: rgba(255,207,95,.14);
   color: rgb(255,207,95);
 }
-.host-mode-control {
-  display: grid;
-  grid-template-columns: repeat(3, auto);
-  gap: 3px;
-  min-width: 0;
-}
-.host-mode-control button,
 .feedback-btn {
   height: 25px;
   border-radius: 0;
@@ -552,7 +548,6 @@ html, body {
   cursor: pointer;
   box-shadow: rgba(98,226,255,.45) 2px 2px 0;
 }
-.host-mode-control button.active,
 .feedback-btn:hover {
   background: rgb(98,226,255);
   color: rgb(1,5,14);
@@ -725,6 +720,7 @@ html, body {
   grid-template-columns: auto minmax(0, 1fr);
   align-items: center;
   gap: 10px;
+  min-width: 0;
   margin: 10px 16px 12px;
   padding: 8px;
   background:
@@ -888,17 +884,21 @@ html, body {
   .session-card {
     grid-column: 1 / -1;
   }
-  .host-mode-control {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    flex: 1 1 auto;
-  }
   .player {
     grid-template-columns: auto 1fr;
-    gap: 8px;
     margin: 8px 14px 10px;
   }
   .player-controls {
     justify-content: start;
+  }
+}
+
+@media (max-width: 520px) {
+  .player {
+    grid-template-columns: 1fr;
+  }
+  .player-progress {
+    grid-template-columns: auto minmax(0, 1fr);
   }
 }
 
@@ -1027,11 +1027,6 @@ html, body {
       <div class="station-console" aria-label="Station controls">
         <div class="signal-row">
           <div class="signal-badge" id="signalBadge">Live Signal</div>
-          <div class="host-mode-control" id="hostModeControl" role="group" aria-label="Host mode">
-            <button type="button" data-mode="quiet">Quiet</button>
-            <button type="button" data-mode="story">Story</button>
-            <button type="button" data-mode="companion">Companion</button>
-          </div>
         </div>
         <div class="action-row">
           <button type="button" class="feedback-btn" id="moreLikeBtn">More like this</button>
@@ -1151,7 +1146,6 @@ const metaSub    = document.getElementById('metaSub');
 const metaSource = document.getElementById('metaSource');
 const metaSourceText = document.getElementById('metaSourceText');
 const signalBadge = document.getElementById('signalBadge');
-const hostModeControl = document.getElementById('hostModeControl');
 const moreLikeBtn = document.getElementById('moreLikeBtn');
 const changeVibeBtn = document.getElementById('changeVibeBtn');
 const sessionCard = document.getElementById('sessionCard');
@@ -1165,9 +1159,8 @@ const fullscreenToggle = document.getElementById('fullscreenToggle');
 const emptyState = document.getElementById('emptyState');
 const starCanvas = document.getElementById('starCanvas');
 let djLanguage = localStorage.getItem('claudio:dj-language') === 'zh' ? 'zh' : 'en';
-let hostMode = ['quiet', 'story', 'companion'].includes(localStorage.getItem('claudio:host-mode'))
-  ? localStorage.getItem('claudio:host-mode')
-  : 'story';
+const musicProvider = 'spotify';
+localStorage.setItem('claudio:music-provider', musicProvider);
 let currentSignalState = 'live';
 let djVolume = Number(localStorage.getItem('claudio:dj-volume') || 100) / 100;
 let baseMusicVolume = Number(localStorage.getItem('claudio:music-volume') || 100) / 100;
@@ -1326,18 +1319,29 @@ let spotifyTrackDurationMs = 0;
 let spotifyEndTimer = null;
 let spotifyProgressTimer = null;
 
-function syncHostModeControl() {
-  hostModeControl?.querySelectorAll('button').forEach(button => {
-    const active = button.dataset.mode === hostMode;
-    button.classList.toggle('active', active);
-    button.setAttribute('aria-pressed', String(active));
-  });
+function normalizeMusicProvider(value) {
+  return 'spotify';
 }
 
-function setHostMode(value) {
-  hostMode = ['quiet', 'story', 'companion'].includes(value) ? value : 'story';
-  localStorage.setItem('claudio:host-mode', hostMode);
-  syncHostModeControl();
+function optionalMusicProvider(value) {
+  return value === 'spotify' ? 'spotify' : '';
+}
+
+function musicProviderLabel(provider = musicProvider) {
+  return 'Spotify';
+}
+
+function inferMusicProviderFromTracks(tracks = []) {
+  if (!Array.isArray(tracks)) return '';
+  if (tracks.some(track => track?.source === 'spotify' || track?.provider === 'spotify' || track?.spotifyUri)) return 'spotify';
+  return '';
+}
+
+function stationMusicProvider() {
+  const hasActiveStation = currentProgramId || queue.length || musicIsPlaying() || awaitingNextTrack;
+  return hasActiveStation
+    ? normalizeMusicProvider(activeProgramMusicProvider || musicProvider)
+    : normalizeMusicProvider(musicProvider);
 }
 
 function setSignalState(state = 'live') {
@@ -1362,7 +1366,7 @@ function renderSessionCard({ signal = currentSignalState } = {}) {
   const signalText = signal === 'backup' ? 'Backup' : 'Live';
   const titleEl = document.createElement('strong');
   titleEl.textContent = title;
-  const details = ` · ${signalText} · ${hostMode} host · ${count} track${count === 1 ? '' : 's'}${current ? ` · now ${current}` : ''}`;
+  const details = ` · ${signalText} · ${musicProviderLabel(stationMusicProvider())} · ${count} track${count === 1 ? '' : 's'}${current ? ` · now ${current}` : ''}`;
   sessionCard.replaceChildren(titleEl, document.createTextNode(details));
 }
 
@@ -1381,8 +1385,6 @@ function renderStationContext(options = {}) {
   renderSessionCard(options);
   renderUpNext();
 }
-
-syncHostModeControl();
 
 function setStationNotice(message = '', link = null) {
   if (!stationNotice) return;
@@ -2225,8 +2227,21 @@ let voiceSequenceActive = false;
 let programClockStartedAt = null;
 let currentTrackStartedAt = 0;
 let currentProgramId = null;
+let activeProgramMusicProvider = '';
+let pendingProgramMusicProvider = '';
+let pendingProgramHandoff = null;
 let lastRefillAt = 0;
 renderStationContext();
+
+function lockProgramMusicProvider(provider = '', tracks = []) {
+  activeProgramMusicProvider = optionalMusicProvider(provider) ||
+    inferMusicProviderFromTracks(tracks) ||
+    optionalMusicProvider(pendingProgramMusicProvider) ||
+    optionalMusicProvider(activeProgramMusicProvider) ||
+    normalizeMusicProvider(musicProvider);
+  pendingProgramMusicProvider = '';
+  return activeProgramMusicProvider;
+}
 
 function segmentKey(segment) {
   if (!segment) return '';
@@ -2365,6 +2380,9 @@ function resetProgramPlaybackState() {
   voiceObjectActive = false;
   voiceSequenceActive = false;
   requestLineActive = false;
+  activeProgramMusicProvider = '';
+  pendingProgramMusicProvider = '';
+  pendingProgramHandoff = null;
 
   try {
     ttsAudio.dispatchEvent(new Event('error'));
@@ -2576,6 +2594,7 @@ function autoRefill() {
   lastRefillAt = Date.now();
   autoRefilling = true;
   const previousIndex = queue.length - 1;
+  const refillMusicProvider = normalizeMusicProvider(activeProgramMusicProvider || musicProvider);
   fetch('/api/radio/refill', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -2588,7 +2607,7 @@ function autoRefill() {
       queue: queue.map(({ query, title, artist }) => ({ query, title, artist })),
       queueLength: queue.length,
       djLanguage,
-      hostMode,
+      musicProvider: refillMusicProvider,
     }),
   })
     .then(async res => {
@@ -2778,6 +2797,103 @@ function enqueueAndPlay(tracks, { autoPlay = true } = {}) {
   return freshTracks;
 }
 
+function setRetuneControls(active) {
+  retuningStation = active;
+  if (moreLikeBtn) moreLikeBtn.disabled = active;
+  if (changeVibeBtn) changeVibeBtn.disabled = active;
+}
+
+function programStartSegmentsForCurrentQueue(msg) {
+  return offsetSegmentsForQueue(normalizeIncomingSegments(msg), queue.length);
+}
+
+function firstProgramSegments(segments) {
+  return segments.filter(segment =>
+    segment.position === 'immediate' ||
+    (segment.position === 'before_track' && (segment.trackIndex ?? 0) === queueIdx)
+  );
+}
+
+function activateProgramStart(msg, { incomingSegments = null, spokenSegments = [] } = {}) {
+  serverSessionActive = true;
+  startingRadio = false;
+  playBtn.disabled = false;
+  currentProgramId = msg.programId || currentProgramId;
+  lockProgramMusicProvider(msg.musicProvider, msg.tracks);
+  if (msg.sessionTitle) sessionTitleEl.textContent = msg.sessionTitle;
+  setSignalState(msg.signal === 'backup' ? 'backup' : 'live');
+  if (msg.stationName || msg.programName) {
+    metaSub.textContent = [msg.stationName, msg.programName].filter(Boolean).join(' · ');
+  }
+  resetProgramClock();
+  const tracks = msg.tracks || [];
+  const segments = incomingSegments || programStartSegmentsForCurrentQueue(msg);
+  scriptSegments = [...scriptSegments, ...segments];
+  spokenSegments.forEach(markSegmentHandled);
+  const immediateSegments = firstProgramSegments(segments);
+  if (tracks.length && msg.openingReady && immediateSegments.length && playbackIsEmpty()) {
+    const freshTracks = enqueueAndPlay(tracks, { autoPlay: false });
+    renderStationContext({ signal: msg.signal === 'backup' ? 'backup' : 'live' });
+    if (freshTracks.length) {
+      const openingSegments = immediateSegments.map((segment, index) => ({
+        ...segment,
+        resetClockOnSpeak: index === 0,
+      }));
+      speakSegmentSequence(openingSegments, () => {
+        if (playbackIsEmpty() && queue[queueIdx]) playTrack(queue[queueIdx]);
+        maybeRefillAhead();
+      });
+      return;
+    }
+  }
+  if (tracks.length) enqueueAndPlay(tracks);
+  renderStationContext({ signal: msg.signal === 'backup' ? 'backup' : 'live' });
+  if (immediateSegments.length) queueImmediateSegments(immediateSegments);
+}
+
+function bufferProgramHandoffMessage(msg, bucket) {
+  if (!pendingProgramHandoff?.programId || msg.programId !== pendingProgramHandoff.programId) return false;
+  pendingProgramHandoff[bucket].push(msg);
+  return true;
+}
+
+function startProgramHandoff(msg) {
+  const incomingSegments = normalizeIncomingSegments(msg);
+  const openingSegments = incomingSegments
+    .filter(segment =>
+      segment.position === 'immediate' ||
+      (segment.position === 'before_track' && (segment.trackIndex ?? 0) === 0)
+    )
+    .map((segment, index) => ({
+      ...segment,
+      resetClockOnSpeak: index === 0,
+    }));
+  const handoff = {
+    programId: msg.programId,
+    tracksReady: [],
+    segmentReady: [],
+  };
+  pendingProgramHandoff = handoff;
+
+  const switchToNewProgram = () => {
+    if (pendingProgramHandoff !== handoff) return;
+    const bufferedTracks = handoff.tracksReady;
+    const bufferedSegments = handoff.segmentReady;
+    resetProgramPlaybackState();
+    activateProgramStart(msg, { incomingSegments, spokenSegments: openingSegments });
+    bufferedTracks.forEach(handleWsMessage);
+    bufferedSegments.forEach(handleWsMessage);
+    setRetuneControls(false);
+  };
+
+  if (msg.openingReady && openingSegments.length && musicIsPlaying()) {
+    renderStationContext({ signal: msg.signal === 'backup' ? 'backup' : 'live' });
+    speakSegmentSequence(openingSegments, switchToNewProgram);
+    return;
+  }
+  switchToNewProgram();
+}
+
 function normalizeIncomingSegments(msg) {
   if (Array.isArray(msg.segments) && msg.segments.length) return msg.segments;
   const segments = [];
@@ -2856,50 +2972,28 @@ function handleWsMessage(msg) {
 
   if (msg.type === 'program-start') {
     serverSessionActive = true;
-    if (msg.programId && currentProgramId && msg.programId !== currentProgramId) {
-      resetProgramPlaybackState();
-    }
-    startingRadio = false;
-    playBtn.disabled = false;
-    currentProgramId = msg.programId || currentProgramId;
-    if (msg.sessionTitle) sessionTitleEl.textContent = msg.sessionTitle;
-    setSignalState(msg.signal === 'backup' ? 'backup' : 'live');
-    if (msg.stationName || msg.programName) {
-      metaSub.textContent = [msg.stationName, msg.programName].filter(Boolean).join(' · ');
-    }
-    resetProgramClock();
     const tracks = msg.tracks || [];
-    const incomingSegments = offsetSegmentsForQueue(normalizeIncomingSegments(msg), queue.length);
-    scriptSegments = [...scriptSegments, ...incomingSegments];
-    const immediateSegments = findSegments(segment =>
-      segment.position === 'immediate' ||
-      (segment.position === 'before_track' && (segment.trackIndex ?? 0) === queueIdx)
-    );
-    if (tracks.length && msg.openingReady && immediateSegments.length && playbackIsEmpty()) {
-      const freshTracks = enqueueAndPlay(tracks, { autoPlay: false });
-      renderStationContext({ signal: msg.signal === 'backup' ? 'backup' : 'live' });
-      if (freshTracks.length) {
-        const openingSegments = immediateSegments.map((segment, index) => ({
-          ...segment,
-          resetClockOnSpeak: index === 0,
-        }));
-        speakSegmentSequence(openingSegments, () => {
-          if (playbackIsEmpty() && queue[queueIdx]) playTrack(queue[queueIdx]);
-          maybeRefillAhead();
-        });
-        return;
-      }
+    const retuningCurrentProgram = msg.programId && currentProgramId && msg.programId !== currentProgramId;
+    if (retuningCurrentProgram && tracks.length && musicIsPlaying()) {
+      startingRadio = false;
+      playBtn.disabled = false;
+      startProgramHandoff(msg);
+      return;
     }
-    if (tracks.length) enqueueAndPlay(tracks);
-    renderStationContext({ signal: msg.signal === 'backup' ? 'backup' : 'live' });
-    if (immediateSegments.length) queueImmediateSegments(immediateSegments);
+    if (retuningCurrentProgram) resetProgramPlaybackState();
+    activateProgramStart(msg);
+    setRetuneControls(false);
     return;
   }
 
   if (msg.type === 'tracks-ready') {
+    if (bufferProgramHandoffMessage(msg, 'tracksReady')) return;
     if (msg.programId && currentProgramId && msg.programId !== currentProgramId) return;
     serverSessionActive = true;
     currentProgramId = msg.programId || currentProgramId;
+    if (msg.musicProvider || !activeProgramMusicProvider) {
+      activeProgramMusicProvider = normalizeMusicProvider(msg.musicProvider || inferMusicProviderFromTracks(msg.tracks) || activeProgramMusicProvider || musicProvider);
+    }
     autoRefilling = false;
     if (msg.tracks?.length) {
       enqueueAndPlay(msg.tracks, { autoPlay: !msg.tail });
@@ -2914,6 +3008,7 @@ function handleWsMessage(msg) {
   }
 
   if (msg.type === 'segment-ready') {
+    if (bufferProgramHandoffMessage(msg, 'segmentReady')) return;
     if (msg.programId && currentProgramId && msg.programId !== currentProgramId) return;
     currentProgramId = msg.programId || currentProgramId;
     const incomingSegments = normalizeIncomingSegments(msg);
@@ -2943,6 +3038,7 @@ function handleWsMessage(msg) {
       if (!currentProgramId && !queue.length) serverSessionActive = false;
       startingRadio = false;
       playBtn.disabled = false;
+      setRetuneControls(false);
       setRadioStatus('Paused');
       metaSub.textContent = '';
       addSystemLine(msg.userMessage || userFacingSystemMessage(msg.error || 'Could not start Claudio FM'));
@@ -2968,6 +3064,9 @@ function handleWsMessage(msg) {
   }
 
   if (msg.type === 'now-playing') {
+    if (msg.musicProvider || (msg.tracks?.length && !activeProgramMusicProvider)) {
+      activeProgramMusicProvider = normalizeMusicProvider(msg.musicProvider || inferMusicProviderFromTracks(msg.tracks) || activeProgramMusicProvider || musicProvider);
+    }
     if (msg.sessionTitle) sessionTitleEl.textContent = msg.sessionTitle;
     setSignalState(msg.signal === 'backup' ? 'backup' : 'live');
     if (msg.stationName || msg.programName) {
@@ -3036,21 +3135,24 @@ connectWS();
 /* ── Chat ─────────────────────────────────────────────────────────── */
 async function requestChat(message, { showUserTurn = true, autoStart = false } = {}) {
   if (showUserTurn) addUserTurn(message);
+  const requestMusicProvider = normalizeMusicProvider(musicProvider);
   const res = await fetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message, djLanguage, hostMode, autoStart }),
+    body: JSON.stringify({ message, djLanguage, musicProvider: requestMusicProvider, autoStart }),
   });
   if (!res.ok) throw new Error(await res.text());
-  return res.json().catch(() => ({}));
+  const body = await res.json().catch(() => ({}));
+  if (body?.jobType === 'program_start' && body.queued !== false) {
+    pendingProgramMusicProvider = requestMusicProvider;
+  }
+  return body;
 }
 
 async function requestVibeShift(kind) {
   markUserPlaybackIntent();
   if (startingRadio || retuningStation) return;
-  retuningStation = true;
-  if (moreLikeBtn) moreLikeBtn.disabled = true;
-  if (changeVibeBtn) changeVibeBtn.disabled = true;
+  setRetuneControls(true);
   const current = queue[queueIdx];
   const currentText = current ? sessionTrackLabel(current) : 'the current station mood';
   const message = kind === 'more'
@@ -3058,14 +3160,12 @@ async function requestVibeShift(kind) {
     : `Change the vibe: move away from ${currentText} and retune the station in a fresh direction.`;
   addSystemLine(kind === 'more' ? 'Tuning more like this…' : 'Changing the station vibe…');
   try {
-    await requestChat(message, { showUserTurn: true });
+    const result = await requestChat(message, { showUserTurn: true });
+    if (!result?.queued) setRetuneControls(false);
   } catch (err) {
     console.error('[vibe-shift]', err);
     addSystemLine('Could not retune Claudio FM');
-  } finally {
-    retuningStation = false;
-    if (moreLikeBtn) moreLikeBtn.disabled = false;
-    if (changeVibeBtn) changeVibeBtn.disabled = false;
+    setRetuneControls(false);
   }
 }
 
@@ -3149,13 +3249,6 @@ chatInput.addEventListener('input', () => {
   chatInput.style.height = Math.min(chatInput.scrollHeight, 84) + 'px';
 });
 chatSend.addEventListener('click', sendMessage);
-
-hostModeControl?.addEventListener('click', e => {
-  const button = e.target.closest('button[data-mode]');
-  if (!button) return;
-  setHostMode(button.dataset.mode);
-  renderStationContext();
-});
 
 moreLikeBtn?.addEventListener('click', () => requestVibeShift('more'));
 changeVibeBtn?.addEventListener('click', () => requestVibeShift('change'));

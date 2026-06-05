@@ -1,4 +1,3 @@
-const netease = require('./music-netease');
 const spotify = require('./music-spotify');
 const ytDlp = require('./music-yt-dlp');
 
@@ -10,11 +9,19 @@ function ytDlpFallbackEnabled() {
   return fallbackProvider() === 'yt-dlp';
 }
 
-async function getTrack(query) {
-  const provider = process.env.MUSIC_PROVIDER || 'auto';
+function normalizeProvider(value) {
+  return 'spotify';
+}
+
+function selectedProvider(options = {}) {
+  return normalizeProvider(String(options.provider || process.env.MUSIC_PROVIDER || 'spotify').trim().toLowerCase());
+}
+
+async function getTrack(query, options = {}) {
+  const provider = selectedProvider(options);
   console.log(`[音乐] 搜索: "${query}" (来源: ${provider})`);
 
-  if (provider === 'spotify' || (provider === 'auto' && process.env.SPOTIFY_CLIENT_ID && process.env.SPOTIFY_CLIENT_SECRET)) {
+  if (provider === 'spotify') {
     const spotifyTrack = await spotify.getTrack(query);
     if (spotifyTrack) {
       console.log(`[音乐] Spotify 找到: ${spotifyTrack.title || query}${spotifyTrack.artist ? ' — ' + spotifyTrack.artist : ''}`);
@@ -28,22 +35,7 @@ async function getTrack(query) {
     }
   }
 
-  if (provider === 'netease' || process.env.MUSIC_ENABLE_NETEASE === '1') {
-    const neteaseTrack = await netease.getTrack(query);
-    if (neteaseTrack) {
-      console.log(`[音乐] 网易云找到: ${neteaseTrack.title || query}`);
-      return neteaseTrack;
-    }
-    if (provider === 'netease') {
-      console.log(`[音乐] 网易云未找到: "${query}"`);
-      return null;
-    }
-    console.log(ytDlpFallbackEnabled()
-      ? `[音乐] 网易云未找到，尝试 yt-dlp…`
-      : `[音乐] 网易云未找到，已关闭 yt-dlp fallback`);
-  }
-
-  if (provider !== 'netease' && ytDlpFallbackEnabled()) {
+  if (ytDlpFallbackEnabled()) {
     const ytTrack = await ytDlp.getTrack(query);
     if (ytTrack) {
       console.log(`[音乐] yt-dlp 找到: ${ytTrack.title || query}`);
@@ -53,18 +45,15 @@ async function getTrack(query) {
     return ytTrack;
   }
 
-  if (provider !== 'netease') {
-    console.log(`[音乐] 未找到且未启用 yt-dlp fallback: "${query}"`);
-  }
-
+  console.log(`[音乐] 未找到且未启用 yt-dlp fallback: "${query}"`);
   return null;
 }
 
 async function getArtistTracks(query, count = 3, options = {}) {
-  const provider = process.env.MUSIC_PROVIDER || 'auto';
+  const provider = selectedProvider(options);
   console.log(`[音乐] 搜索歌手: "${query}" (来源: ${provider})`);
 
-  if (provider === 'spotify' || (provider === 'auto' && process.env.SPOTIFY_CLIENT_ID && process.env.SPOTIFY_CLIENT_SECRET)) {
+  if (provider === 'spotify') {
     const tracks = await spotify.getArtistTracks(query, count, options);
     if (tracks.length) {
       console.log(`[音乐] Spotify 歌手找到: ${query} → ${tracks.map(track => track.title).join(', ')}`);
