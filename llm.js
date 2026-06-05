@@ -7,6 +7,9 @@ const DEFAULT_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 120000);
 const DEFAULT_PROVIDER = process.env.LLM_PROVIDER || 'deepseek';
 const CODEX_COMMAND = process.env.CODEX_CLI_COMMAND || 'codex';
 const CODEX_MODEL = process.env.CODEX_MODEL || '';
+const CODEX_PROFILE = process.env.CODEX_PROFILE || '';
+const CODEX_CONFIG_ARGS = splitCliArgs(process.env.CODEX_CLI_CONFIG_ARGS || '');
+const CODEX_IGNORE_RULES = envFlag('CODEX_IGNORE_RULES', true);
 const CODEX_SCHEMA_PATH = process.env.CODEX_OUTPUT_SCHEMA || path.join(__dirname, 'schemas', 'llm-response.schema.json');
 const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com';
 const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-v4-flash';
@@ -44,6 +47,59 @@ function splitProviderList(value) {
     .split(',')
     .map(provider => provider.trim())
     .filter(Boolean);
+}
+
+function splitCliArgs(value) {
+  const input = String(value || '').trim();
+  if (!input) return [];
+  const args = [];
+  let current = '';
+  let quote = '';
+  let escaping = false;
+
+  for (const ch of input) {
+    if (escaping) {
+      current += ch;
+      escaping = false;
+      continue;
+    }
+    if (ch === '\\') {
+      escaping = true;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = '';
+      else current += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (current) {
+        args.push(current);
+        current = '';
+      }
+      continue;
+    }
+    current += ch;
+  }
+  if (escaping) current += '\\';
+  if (current) args.push(current);
+  return args;
+}
+
+function normalizeCliArgs(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value.map(String).filter(Boolean);
+  return splitCliArgs(value);
+}
+
+function envFlag(name, defaultValue = false) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return defaultValue;
+  return /^(1|true|yes|on)$/i.test(raw);
 }
 
 async function callProviderWithRetry(provider, prompt, options = {}) {
@@ -211,20 +267,9 @@ function callCodexCli(prompt, options = {}) {
   const timeoutMs = options.timeoutMs || DEFAULT_TIMEOUT_MS;
   const startAt = Date.now();
   const outputPath = path.join(os.tmpdir(), `claudio-codex-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
-  const args = [
-    'exec',
-    '--ephemeral',
-    '--sandbox',
-    'read-only',
-    '--output-schema',
-    CODEX_SCHEMA_PATH,
-    '-o',
-    outputPath,
-    '-',
-  ];
-  if (CODEX_MODEL) args.splice(1, 0, '-m', CODEX_MODEL);
+  const args = buildCodexArgs(outputPath, options);
 
-  console.log(`[LLM:codex_cli] 调用中，prompt ${prompt.length} 字符，timeout ${Math.round(timeoutMs / 1000)}s…`);
+  console.log(`[LLM:codex_cli] 调用中，prompt ${prompt.length} 字符，timeout ${Math.round(timeoutMs / 1000)}s，model ${codexModelForOptions(options) || 'default'}…`);
   return new Promise((resolve, reject) => {
     const proc = spawn(CODEX_COMMAND, args, {
       env: { ...process.env },
@@ -291,6 +336,35 @@ function callCodexCli(prompt, options = {}) {
   });
 }
 
+function codexModelForOptions(options = {}) {
+  return options.codexModel || options.model || CODEX_MODEL;
+}
+
+function buildCodexArgs(outputPath, options = {}) {
+  const model = codexModelForOptions(options);
+  const profile = options.codexProfile || CODEX_PROFILE;
+  const configArgs = [
+    ...CODEX_CONFIG_ARGS,
+    ...normalizeCliArgs(options.codexConfigArgs),
+  ];
+  const args = ['exec'];
+  if (model) args.push('-m', model);
+  if (profile) args.push('-p', profile);
+  if (options.codexIgnoreRules ?? CODEX_IGNORE_RULES) args.push('--ignore-rules');
+  args.push(
+    ...configArgs,
+    '--ephemeral',
+    '--sandbox',
+    'read-only',
+    '--output-schema',
+    CODEX_SCHEMA_PATH,
+    '-o',
+    outputPath,
+    '-',
+  );
+  return args;
+}
+
 function withTimeout(promise, timeoutMs, message) {
   let timer;
   const timeout = new Promise((_, reject) => {
@@ -331,5 +405,7 @@ module.exports = {
   _test: {
     providerChain,
     splitProviderList,
+    splitCliArgs,
+    buildCodexArgs,
   },
 };

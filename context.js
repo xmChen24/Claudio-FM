@@ -146,28 +146,29 @@ function buildProgramStartPrompt(userInput, queueState = '', options = {}) {
   const arcDetails = programArcText(options);
   const correctionDetails = correctionText(options);
   return [
-    sharedContext(),
+    sharedContext({ includeDialog: false, recentPlayLimit: 12 }),
     queueState ? `# 当前队列状态\n${queueState}` : '',
-    `# 电台任务\nprogram_start：开播选歌。只生成节目标题、2-3 首歌、可选一句 openingLeadIn，以及内部原因。不要生成完整 cold_open、bridge、back_announce 或 quick_touch。`,
+    `# 电台任务\nprogram_start：开播选歌，并为 play[0] 写一段可直接播出的完整 cold_open。`,
     intentDetails ? `# 意图细节\n${intentDetails}` : '',
     arcDetails ? `# 当前节目弧线\n${arcDetails}` : '',
     correctionDetails ? `# 纠错上下文\n${correctionDetails}` : '',
     `# 用户输入 / 启动意图\n${userInput}`,
     [
       'Strictly output JSON only, with no extra text.',
-      djLanguageInstruction(djLanguage, 'openingLeadIn text'),
+      djLanguageInstruction(djLanguage, 'cold_open segment text'),
       hostModeInstruction(hostMode),
       'The "title" should use the same language as the DJ narration.',
-      'Return only: title, play, openingLeadIn, reason.',
+      'Return only fields allowed by the JSON schema. Use title, play, segments, reason, mode, say, and intros. Keep say "" and intros [].',
       'The "play" array must contain 2-3 songs in "song title - artist" format. Keep original-language titles/artists for search.',
+      'The "segments" array must contain 3-5 cold_open segments for play[0], each one sentence, position before_track, trackIndex 0, groupId "open_0".',
       'Do not repeat any song from the recent play history or current queue. Do not include the same song twice in one play array.',
       'Avoid artists that appear in the most recent 5 played songs unless the listener explicitly asked for that artist.',
       'Use dynamic DJ memory as taste and tone guidance, but do not mention the memory system.',
       'If correction context is present, recover from the rejected lane and do not choose the rejected current track or artist unless explicitly required.',
-      'openingLeadIn is optional and must be exactly one short, natural on-air sentence. It is the first sentence of the later cold open, not a station ID.',
-      'openingLeadIn must not say "This is Claudio", "coming up next", "let me", "okay", or explain that you are generating a program.',
-      'Do not include a "segments" array in this response.',
-      '{"title":"program moment name","play":["song - artist"],"openingLeadIn":"One short, non-template on-air first line.","reason":"internal reason"}',
+      'The cold_open must introduce play[0] specifically. If you mention a title or artist, it must come from play[0].',
+      coldOpenLengthInstruction(djLanguage),
+      'Do not say "This is Claudio", "coming up next", "let me", "okay", or explain that you are generating a program.',
+      '{"title":"program moment name","say":"","play":["song - artist","song - artist"],"segments":[{"type":"cold_open","groupId":"open_0","part":"anchor","position":"before_track","trackIndex":0,"text":"One sentence about play[0]."},{"type":"cold_open","groupId":"open_0","part":"turn","position":"before_track","trackIndex":0,"text":"One sentence that develops the opening."},{"type":"cold_open","groupId":"open_0","part":"invitation","position":"before_track","trackIndex":0,"text":"One short sentence into the first track."}],"intros":[],"reason":"internal reason","mode":"program_start"}',
     ].join('\n'),
   ].filter(Boolean).join('\n\n');
 }
@@ -210,7 +211,7 @@ function buildOpeningLeadInPrompt({ programTitle = '', firstTrack = null, userIn
   ].filter(Boolean).join('\n\n');
 }
 
-function buildColdOpenForTracksPrompt({ programTitle = '', tracks = [], userInput = '', djLanguage = 'en', hostMode = 'story', userIntent = '', musicRequest = null, programArc = null, correctionContext = null, leadInText = '' } = {}) {
+function buildColdOpenForTracksPrompt({ programTitle = '', tracks = [], userInput = '', djLanguage = 'en', hostMode = 'story', userIntent = '', musicRequest = null, programArc = null, correctionContext = null, leadInText = '', directRequest = false } = {}) {
   const normalizedLanguage = normalizeDjLanguage(djLanguage);
   const normalizedHostMode = normalizeHostMode(hostMode);
   const intentDetails = intentDetailText({ userIntent, musicRequest });
@@ -221,7 +222,10 @@ function buildColdOpenForTracksPrompt({ programTitle = '', tracks = [], userInpu
     : '（无可播放歌曲）';
 
   return [
-    sharedContext({ includeDialog: true, recentPlayLimit: 12 }),
+    sharedContext({
+      includeDialog: !directRequest,
+      recentPlayLimit: directRequest ? 6 : 12,
+    }),
     `# 电台任务\ncold_open_for_resolved_tracks：根据已经确认可播放的真实歌曲生成开场播报。`,
     programTitle ? `# 当前节目标题\n${programTitle}` : '',
     intentDetails ? `# 意图细节\n${intentDetails}` : '',
@@ -243,6 +247,9 @@ function buildColdOpenForTracksPrompt({ programTitle = '', tracks = [], userInpu
       'Do not mention or describe any song that is not in the confirmed playable song list.',
       'The "segments" array must contain only cold_open segments for trackIndex 0.',
       'Write 3-5 consecutive cold_open segments, each one sentence, same position before_track and trackIndex 0.',
+      directRequest
+        ? 'This is a direct listener request with the song already resolved. Do not plan a broader set; focus on why this exact confirmed song fits the request.'
+        : 'Keep the opening connected to the broader program arc without drifting away from the first confirmed track.',
       coldOpenLengthInstruction(normalizedLanguage),
       'Use optional part values: anchor, heart, turn, image, invitation.',
       '{"segments":[{"type":"cold_open","groupId":"open_0","part":"anchor","position":"before_track","trackIndex":0,"text":"One sentence about the exact first confirmed track."},{"type":"cold_open","groupId":"open_0","part":"turn","position":"before_track","trackIndex":0,"text":"One sentence that stays accurate to the confirmed tracks."},{"type":"cold_open","groupId":"open_0","part":"invitation","position":"before_track","trackIndex":0,"text":"One short sentence into the first track."}],"reason":"internal reason"}',

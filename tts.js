@@ -51,6 +51,61 @@ function synthesize(text, options = {}) {
   });
 }
 
+function cleanupCache({
+  maxAgeMs = Number(process.env.TTS_CACHE_MAX_AGE_MS || 7 * 24 * 60 * 60 * 1000),
+  maxFiles = Number(process.env.TTS_CACHE_MAX_FILES || 600),
+} = {}) {
+  let entries = [];
+  try {
+    entries = fs.readdirSync(CACHE_DIR)
+      .filter(name => /^[a-f0-9]{32}\.(mp3|wav)$/i.test(name))
+      .map(name => {
+        const filePath = path.join(CACHE_DIR, name);
+        const stat = fs.statSync(filePath);
+        return { name, filePath, mtimeMs: stat.mtimeMs, size: stat.size };
+      })
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+  } catch (err) {
+    console.warn('[TTS] 缓存扫描失败:', err.message);
+    return { removed: 0, kept: 0, bytesRemoved: 0 };
+  }
+
+  const now = Date.now();
+  let removed = 0;
+  let bytesRemoved = 0;
+  entries.forEach((entry, index) => {
+    const tooOld = maxAgeMs > 0 && now - entry.mtimeMs > maxAgeMs;
+    const tooMany = maxFiles > 0 && index >= maxFiles;
+    if (!tooOld && !tooMany) return;
+    try {
+      fs.unlinkSync(entry.filePath);
+      removed++;
+      bytesRemoved += entry.size;
+    } catch (err) {
+      console.warn(`[TTS] 删除缓存失败 ${entry.name}:`, err.message);
+    }
+  });
+
+  const kept = Math.max(0, entries.length - removed);
+  if (removed) {
+    console.log(`[TTS] 缓存清理 removed=${removed} kept=${kept} bytes=${bytesRemoved}`);
+  }
+  return { removed, kept, bytesRemoved };
+}
+
+async function warmup(options = {}) {
+  const enabled = String(options.enabled ?? process.env.TTS_WARMUP_ON_START ?? '1').toLowerCase();
+  if (enabled === '0' || enabled === 'false' || enabled === 'no') return { skipped: true };
+  const text = options.text || process.env.TTS_WARMUP_TEXT || 'Claudio is warming the signal.';
+  const startAt = Date.now();
+  const filePath = await synthesize(text, { role: 'warmup' });
+  return {
+    skipped: false,
+    file: path.basename(filePath),
+    elapsedMs: Date.now() - startAt,
+  };
+}
+
 function getVoiceForProvider(provider, options = {}) {
   if (provider === 'fish') return options.voiceId || process.env.FISH_VOICE_ID || '';
   if (provider === 'volcengine') return options.voiceType || process.env.VOLCENGINE_TTS_VOICE_TYPE || '';
@@ -264,4 +319,4 @@ async function synthesizeKokoro(text, outPath, options = {}) {
   return outPath;
 }
 
-module.exports = { synthesize, cachePath };
+module.exports = { synthesize, cachePath, cleanupCache, warmup };

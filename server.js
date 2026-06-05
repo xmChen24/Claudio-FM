@@ -9,7 +9,7 @@ const { WebSocketServer } = require('ws');
 const { route } = require('./router');
 const { buildPrompt, buildProgramStartPrompt, buildColdOpenForTracksPrompt, buildMusicRefillPrompt, buildBridgePrompt } = require('./context');
 const { callClaude } = require('./claude');
-const { synthesize } = require('./tts');
+const { synthesize, cleanupCache: cleanupTtsCache, warmup: warmupTts } = require('./tts');
 const { getTrack, getArtistTracks } = require('./music');
 const { addPlay, addMessage, recentPlays, getPref } = require('./state');
 const { environmentSnapshot, updateEnvironment } = require('./env-context');
@@ -172,6 +172,31 @@ function metricTimer(label) {
     snapshot(extra = {}) {
       return { label, totalMs: Date.now() - startedAt, ...marks, ...extra };
     },
+    summary(extra = {}) {
+      const snapshot = this.snapshot(extra);
+      console.log(`[metric:${label}:summary] ${JSON.stringify(snapshot)}`);
+      recordMetric(snapshot);
+      return snapshot;
+    },
+  };
+}
+
+function envNumber(name, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function llmOptionsForPhase(phase) {
+  const prefix = String(phase || '').toUpperCase().replace(/[^A-Z0-9]+/g, '_');
+  const timeoutMs = envNumber(`${prefix}_LLM_TIMEOUT_MS`, envNumber('LLM_TIMEOUT_MS', 120000));
+  const model = process.env[`${prefix}_LLM_MODEL`] || process.env[`${prefix}_CODEX_MODEL`] || '';
+  const codexProfile = process.env[`${prefix}_CODEX_PROFILE`] || '';
+  const codexConfigArgs = process.env[`${prefix}_CODEX_CONFIG_ARGS`] || '';
+  return {
+    timeoutMs,
+    ...(model ? { model } : {}),
+    ...(codexProfile ? { codexProfile } : {}),
+    ...(codexConfigArgs ? { codexConfigArgs } : {}),
   };
 }
 
@@ -227,6 +252,7 @@ const MUSIC_RESOLVE_CONCURRENCY = Math.max(1, Number(process.env.MUSIC_RESOLVE_C
 const TTS_SYNTH_CONCURRENCY = Math.max(1, Number(process.env.TTS_SYNTH_CONCURRENCY || 3));
 const TTS_SYNTH_RETRIES = Math.max(0, Number(process.env.TTS_SYNTH_RETRIES || 2));
 const DIRECT_ARTIST_TRACK_COUNT = Math.max(1, Number(process.env.DIRECT_ARTIST_TRACK_COUNT || 3));
+const LLM_SUBPROCESS_CONCURRENCY = Math.max(1, Number(process.env.LLM_SUBPROCESS_CONCURRENCY || 1));
 const FALLBACK_PROGRAM_TRACKS = [
   'Sweet Disposition - The Temper Trap',
   'Ventura Highway - America',
@@ -261,7 +287,35 @@ const stationState = {
   foregroundActiveJob: null,
   backgroundWorkerRunning: false,
   backgroundActiveJob: null,
+  lastMetrics: [],
+  llmActive: 0,
+  llmPending: 0,
+  ttsCacheCleanup: null,
+  ttsWarmup: null,
 };
+
+const llmWaiters = [];
+
+function recordMetric(snapshot) {
+  if (!snapshot?.label) return;
+  stationState.lastMetrics.unshift({ ...snapshot, at: Date.now() });
+  stationState.lastMetrics = stationState.lastMetrics.slice(0, 20);
+}
+
+function runtimeDiagnostics() {
+  return {
+    metrics: stationState.lastMetrics,
+    llm: {
+      active: stationState.llmActive,
+      pending: stationState.llmPending,
+      concurrency: LLM_SUBPROCESS_CONCURRENCY,
+    },
+    tts: {
+      warmup: stationState.ttsWarmup,
+      cacheCleanup: stationState.ttsCacheCleanup,
+    },
+  };
+}
 
 function normalizeDjLanguage(value) {
   return value === 'zh' ? 'zh' : 'en';
@@ -1026,6 +1080,36 @@ async function mapWithConcurrency(items, concurrency, mapper) {
   return results;
 }
 
+async function acquireLlmSlot(phase = 'llm') {
+  if (stationState.llmActive < LLM_SUBPROCESS_CONCURRENCY) {
+    stationState.llmActive++;
+    return 0;
+  }
+  const startAt = Date.now();
+  stationState.llmPending++;
+  await new Promise(resolve => llmWaiters.push(resolve));
+  stationState.llmPending--;
+  stationState.llmActive++;
+  const waitedMs = Date.now() - startAt;
+  console.log(`[LLM:${phase}] 等待子进程槽 ${waitedMs}ms`);
+  return waitedMs;
+}
+
+function releaseLlmSlot() {
+  stationState.llmActive = Math.max(0, stationState.llmActive - 1);
+  const next = llmWaiters.shift();
+  if (next) next();
+}
+
+async function callRadioLlm(prompt, phase) {
+  await acquireLlmSlot(phase);
+  try {
+    return await callClaude(prompt, llmOptionsForPhase(phase));
+  } finally {
+    releaseLlmSlot();
+  }
+}
+
 function enqueueJob(job) {
   const key = job.key || `${job.type}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
   if (stationState.jobKeys.has(key)) {
@@ -1061,6 +1145,17 @@ function autoStartInvalidated(job) {
   return job?.source === 'autoStart'
     && stationState.lastUserRequestAt
     && stationState.lastUserRequestAt > (job.createdAt || 0);
+}
+
+function resetEmptyProgramState(programId) {
+  if (!programId || stationState.programId !== programId) return;
+  if (stationState.tracks.length) return;
+  stationState.programId = null;
+  stationState.sessionTitle = '';
+  stationState.programArc = null;
+  stationState.lastProgramPayload = null;
+  nowPlaying = null;
+  console.log(`[program_start] cleared empty program state ${programId}`);
 }
 
 async function drainForegroundJobs() {
@@ -1247,7 +1342,7 @@ async function runProgramStartJob(job) {
       hostMode: job.hostMode,
     });
     try {
-      result = await callClaude(prompt);
+      result = await callRadioLlm(prompt, 'program_start');
       timing.mark('choose_tracks_ms');
     } catch (err) {
       console.warn(`[program_start] LLM unavailable: ${err.message}`);
@@ -1297,6 +1392,7 @@ async function runProgramStartJob(job) {
       failedTracks,
       programArc,
       timing,
+      llmPhase: job.musicRequest ? 'direct_cold_open' : 'cold_open',
     });
     if (autoStartInvalidated(job)) {
       console.log(`[program_start] 自动开台 cold open 已被用户请求取代 ${job.key}`);
@@ -1325,7 +1421,7 @@ async function runProgramStartJob(job) {
       reason: opening.reason || result.reason,
       signal: backupSignal ? 'backup' : 'live',
       openingReady: true,
-      metrics: timing.snapshot({ firstMusicReady: true }),
+      metrics: timing.summary({ firstMusicReady: true }),
     };
     stationState.lastProgramPayload = payload;
     broadcast(payload);
@@ -1352,18 +1448,21 @@ async function runProgramStartJob(job) {
   const coldOpenResult = result || fallbackProgramStartResult(job, 'no playable tracks');
   const segments = await synthesizeSegments(normalizeSegments(coldOpenResult, tracks, false, failedTracks));
 
-  stationState.programId = programId;
-  stationState.sessionTitle = coldOpenResult.title || '';
-  stationState.tracks = tracks;
-  stationState.programArc = createProgramArc({
+  const emptyProgramArc = createProgramArc({
     userInput: job.input || 'Open the station.',
     userIntent: job.userIntent,
     title: coldOpenResult.title || '',
     tracks,
     correctionContext: job.correctionContext,
   });
-  stationState.lastCorrectionContext = job.correctionContext || null;
-  if (tracks.length) nowPlaying = { title: tracks[0].title, artist: tracks[0].artist, startedAt: Date.now() };
+  if (tracks.length) {
+    stationState.programId = programId;
+    stationState.sessionTitle = coldOpenResult.title || '';
+    stationState.tracks = tracks;
+    stationState.programArc = emptyProgramArc;
+    stationState.lastCorrectionContext = job.correctionContext || null;
+    nowPlaying = { title: tracks[0].title, artist: tracks[0].artist, startedAt: Date.now() };
+  }
   addMessage('claudio', segments.filter(s => s.text).map(s => s.text).join('\n\n'));
 
   const payload = {
@@ -1374,45 +1473,63 @@ async function runProgramStartJob(job) {
     sessionTitle: coldOpenResult.title || '',
     stationName: STATION_NAME,
     programName: PROGRAM_NAME,
-    programArc: stationState.programArc,
+    programArc: tracks.length ? stationState.programArc : emptyProgramArc,
     failedTracks,
     reason: coldOpenResult.reason,
     signal: backupSignal ? 'backup' : 'live',
-    metrics: timing.snapshot({ firstMusicReady: false }),
+    metrics: timing.summary({ firstMusicReady: false }),
   };
-  stationState.lastProgramPayload = payload;
+  if (tracks.length) stationState.lastProgramPayload = payload;
   broadcast(payload);
+  if (!tracks.length) resetEmptyProgramState(programId);
 
   return payload;
 }
 
-async function generateColdOpenSegments({ job, result = {}, tracks = [], failedTracks = [], programArc = null, timing }) {
+function provisionalColdOpenMatchesResolvedTrack(result = {}, tracks = []) {
+  const firstTrack = tracks[0];
+  const firstRequest = Array.isArray(result.play) ? result.play[0] : '';
+  if (!firstTrack || !firstRequest) return false;
+  const requested = parseRequestedTrack(firstRequest);
+  return trackMatchesRequest(requested, firstTrack);
+}
+
+async function generateColdOpenSegments({ job, result = {}, tracks = [], failedTracks = [], programArc = null, timing, llmPhase = 'cold_open' }) {
   let coldOpenSegments = (result.segments || []).filter(segment => segment?.type === 'cold_open');
   let coldOpenReason = result.reason;
 
-  broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'phase', phase: 'write_open' });
-  const coldOpenPrompt = buildColdOpenForTracksPrompt({
-    programTitle: result.title || '',
-    tracks,
-    userInput: job.input || 'Open the station.',
-    userIntent: job.userIntent,
-    musicRequest: job.musicRequest,
-    programArc: programArc || job.programArc || stationState.programArc,
-    correctionContext: job.correctionContext,
-    leadInText: '',
-    djLanguage: job.djLanguage,
-    hostMode: job.hostMode,
-  });
-  try {
-    const coldOpenScript = await callClaude(coldOpenPrompt);
-    coldOpenSegments = Array.isArray(coldOpenScript.segments) ? coldOpenScript.segments : coldOpenSegments;
-    coldOpenReason = coldOpenScript.reason || coldOpenReason;
-    timing.mark('write_open_ms');
-  } catch (err) {
-    console.warn(`[${job.type}] Cold open LLM unavailable: ${err.message}`);
-    broadcastUserSystemLog('error', `LLM unavailable: ${err.message}`, { error: err.message });
-    timing.mark('write_open_fallback_ms');
-    throw llmUnavailableError(err, 'Cold open');
+  if (coldOpenSegments.length && provisionalColdOpenMatchesResolvedTrack(result, tracks)) {
+    console.log('[program_start] 复用选歌阶段 cold_open，跳过第二次 LLM');
+    timing.mark('write_open_reused_ms');
+  } else {
+    if (coldOpenSegments.length) {
+      console.log('[program_start] 候选 cold_open 与实际第一首不匹配，重写开场');
+    }
+    broadcast({ type: 'job-status', key: job.key, jobType: job.type, status: 'phase', phase: 'write_open' });
+    const coldOpenPrompt = buildColdOpenForTracksPrompt({
+      programTitle: result.title || '',
+      tracks,
+      userInput: job.input || 'Open the station.',
+      userIntent: job.userIntent,
+      musicRequest: job.musicRequest,
+      programArc: programArc || job.programArc || stationState.programArc,
+      correctionContext: job.correctionContext,
+      leadInText: '',
+      djLanguage: job.djLanguage,
+      hostMode: job.hostMode,
+      directRequest: Boolean(job.musicRequest),
+    });
+    try {
+      const coldOpenScript = await callRadioLlm(coldOpenPrompt, llmPhase);
+      coldOpenSegments = Array.isArray(coldOpenScript.segments) ? coldOpenScript.segments : coldOpenSegments;
+      coldOpenReason = coldOpenScript.reason || coldOpenReason;
+      timing.mark('write_open_ms');
+    } catch (err) {
+      console.warn(`[${job.type}] Cold open LLM unavailable: ${err.message}`);
+      broadcastUserSystemLog('error', `LLM unavailable: ${err.message}`, { error: err.message });
+      timing.mark('write_open_fallback_ms');
+      throw llmUnavailableError(err, 'Cold open');
+    }
   }
 
   if (!coldOpenSegments.length && tracks[0]) {
@@ -1447,6 +1564,7 @@ async function runOpeningGenerationJob(job) {
     failedTracks: job.failedTracks || [],
     programArc: job.programArc || stationState.programArc,
     timing,
+    llmPhase: job.musicRequest ? 'direct_cold_open' : 'cold_open',
   });
 
   if (isStaleProgramJob(job)) {
@@ -1549,7 +1667,7 @@ async function runMusicRefillJob(job) {
     hostMode: job.hostMode,
     programArc: stationState.programArc,
   });
-  const result = await callClaude(prompt);
+  const result = await callRadioLlm(prompt, 'music_refill');
   timing.mark('choose_tracks_ms');
   const { tracks, failedTracks } = await resolveRequestedTracks(result.play || [], { queue });
   timing.mark('resolve_audio_ms');
@@ -1596,7 +1714,7 @@ async function runBridgeGenerationJob(job) {
     hostMode: job.hostMode,
     programArc: job.programArc || stationState.programArc,
   });
-  const result = await callClaude(prompt);
+  const result = await callRadioLlm(prompt, 'bridge');
   timing.mark('write_bridge_ms');
   if (isStaleProgramJob(job)) {
     console.log(`[bridge_generation] skip stale bridge for ${job.programId}`);
@@ -1653,7 +1771,7 @@ async function runRadioSegment(userInput, intent = {}, skipHistory = false) {
     hostMode: intent.hostMode,
   });
   const speechOnly = intent.mode === 'speech-only';
-  const result = await callClaude(prompt);
+  const result = await callRadioLlm(prompt, 'radio_chat');
 
   console.log(`[电台] Claude 回复 → 节目「${result.title || '无标题'}」| 请求曲目 ${result.play?.length || 0} 首`);
   if (result.segments?.length) console.log(`[电台] 脚本段落: ${result.segments.length}`);
@@ -1722,6 +1840,11 @@ app.post('/api/chat', async (req, res) => {
   intent.source = requestSource;
   intent.djLanguage = normalizeDjLanguage(djLanguage);
   intent.hostMode = normalizeHostMode(hostMode);
+  if (autoStart) {
+    intent.mode = 'music';
+    intent.userIntent = 'vibe_request';
+    intent.musicRequest = null;
+  }
   const personalizationSignals = captureUserSignal(message, intent, nowPlaying);
   if (personalizationSignals?.length) {
     intent.personalizationSignals = personalizationSignals;
@@ -1861,7 +1984,12 @@ app.get('/api/session', (req, res) => {
       foregroundQueued: stationState.foregroundJobs.length,
       backgroundQueued: stationState.backgroundJobs.length,
     },
+    diagnostics: runtimeDiagnostics(),
   });
+});
+
+app.get('/api/metrics', (req, res) => {
+  res.json(runtimeDiagnostics());
 });
 
 app.get('/api/environment', async (req, res) => {
@@ -2022,10 +2150,34 @@ function cryptoRandomState() {
   return crypto.randomBytes(24).toString('base64url');
 }
 
+async function bootRuntimeOptimizations() {
+  try {
+    stationState.ttsCacheCleanup = cleanupTtsCache();
+  } catch (err) {
+    stationState.ttsCacheCleanup = { error: err.message };
+    console.warn('[boot] TTS cache cleanup failed:', err.message);
+  }
+
+  try {
+    stationState.ttsWarmup = { status: 'running', startedAt: Date.now() };
+    const warmup = await warmupTts();
+    stationState.ttsWarmup = { status: warmup.skipped ? 'skipped' : 'ready', ...warmup, at: Date.now() };
+    if (!warmup.skipped) {
+      console.log(`[boot] TTS warmup ready in ${warmup.elapsedMs}ms`);
+    }
+  } catch (err) {
+    stationState.ttsWarmup = { status: 'failed', error: err.message, at: Date.now() };
+    console.warn('[boot] TTS warmup failed:', err.message);
+  }
+}
+
 // ── Boot ─────────────────────────────────────────────────────────────────────
 scheduler.init(broadcast, enqueueScheduledProgramStart);
 
 server.listen(PORT, HOST, () => {
   console.log(`\n[电台] Claudio FM 启动 → http://${HOST}:${PORT}`);
   console.log(`[电台] 等待调度器或用户触发…\n`);
+  setTimeout(() => {
+    bootRuntimeOptimizations().catch(err => console.warn('[boot] runtime optimization failed:', err.message));
+  }, 100);
 });

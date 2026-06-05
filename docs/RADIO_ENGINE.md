@@ -44,6 +44,13 @@ The remaining startup tracks are resolved by `music_tail_resolve` and appended
 with `tracks-ready`. Bridge scripts are generated in background jobs after the
 first song path is already moving.
 
+When `program_start` finishes, the server logs one structured
+`[metric:program_start:summary]` line with `choose_tracks_ms`,
+`resolve_audio_ms`, `write_open_ms`, `voice_open_ms`, and `totalMs` when those
+marks are present. Use that line to compare latency changes without changing
+the playback sequence. The latest diagnostics are also available from
+`GET /api/metrics` and under `diagnostics` in `GET /api/session`.
+
 Scheduled openings and hourly checks use the same `program_start` queue. They
 skip if another `program_start` is active or queued, and by default they do not
 interrupt an already active program. Set `SCHEDULER_INTERRUPT_ACTIVE_PROGRAM=1`
@@ -112,7 +119,18 @@ These `.env` values are the main controls for startup speed and resilience:
 | `LLM_RETRY_DELAY_MS` | `1200` | Linear retry delay for LLM failures. |
 | `LLM_TIMEOUT_MS` | `180000` | Hard timeout for LLM calls, including Codex/Claude subprocess calls. |
 | `CODEX_CLI_COMMAND` | `codex` | Command used by the `codex_cli` provider. |
+| `CODEX_MODEL` | empty | Optional Codex model override passed as `codex exec -m`. |
+| `CODEX_PROFILE` | empty | Optional Codex profile override passed as `codex exec -p`. |
+| `CODEX_CLI_CONFIG_ARGS` | `-c model_reasoning_effort=low` | Extra Codex CLI arguments. Keep these to config overrides, not shell commands. |
+| `CODEX_IGNORE_RULES` | `1` | Passes `--ignore-rules` to the radio subprocess so project coding-agent rules do not add unrelated startup work. |
 | `CODEX_OUTPUT_SCHEMA` | `schemas/llm-response.schema.json` | JSON schema passed to `codex exec --output-schema`. |
+| `LLM_SUBPROCESS_CONCURRENCY` | `1` | Serializes LLM subprocess work so background bridge/refill jobs do not compete with opening generation. |
+| `PROGRAM_START_LLM_TIMEOUT_MS` | `180000` | Timeout for automatic opening track selection. |
+| `COLD_OPEN_LLM_TIMEOUT_MS` | `180000` | Timeout for full cold open writing after tracks are known. |
+| `DIRECT_COLD_OPEN_LLM_TIMEOUT_MS` | `150000` | Timeout for direct request cold opens, which should be narrower than automatic openings. |
+| `MUSIC_REFILL_LLM_TIMEOUT_MS` | `120000` | Timeout for background refill set selection. |
+| `BRIDGE_LLM_TIMEOUT_MS` | `90000` | Timeout for between-track bridge writing. |
+| `RADIO_CHAT_LLM_TIMEOUT_MS` | `90000` | Timeout for ordinary chat or speech-only radio turns. |
 | `MUSIC_RESOLVE_CONCURRENCY` | `3` | Parallel music lookup count. Ordering is preserved after resolution. |
 | `DIRECT_ARTIST_TRACK_COUNT` | `3` | Number of artist-matched tracks for direct artist requests. |
 | `MUSIC_FALLBACK_PROVIDER` | `none` | Optional music fallback. Set to `yt-dlp` only when stream URL fallback is explicitly wanted. |
@@ -123,6 +141,9 @@ These `.env` values are the main controls for startup speed and resilience:
 | `SPOTIFY_FAST_START` | `1` | When enabled, Spotify hits skip stream fallback and play through Spotify Web Playback URI. |
 | `TTS_SYNTH_CONCURRENCY` | `3` | Parallel DJ segment TTS synthesis count. |
 | `TTS_SYNTH_RETRIES` | `2` | Retries transient TTS failures. |
+| `TTS_WARMUP_ON_START` | `1` | Synthesizes one short hidden line after server start so the first real DJ line avoids model cold-start where possible. |
+| `TTS_CACHE_MAX_AGE_MS` | `604800000` | Deletes cached TTS files older than this during server boot. |
+| `TTS_CACHE_MAX_FILES` | `600` | Keeps the newest cached TTS files up to this count during server boot. |
 By default, Claudio avoids yt-dlp so direct requests do not wait on video search
 or audio extraction. To restore the older stream URL fallback path, set
 `MUSIC_FALLBACK_PROVIDER=yt-dlp` and `SPOTIFY_FAST_START=0`.
@@ -149,6 +170,7 @@ Useful local endpoints:
 | `GET /api/now` | Current `nowPlaying` snapshot. |
 | `GET /api/program-arc` | Active program arc or inactive state. |
 | `GET /api/session` | Current server-side program, queue, last startup payload, and job status for page-load hydration. |
+| `GET /api/metrics` | Recent runtime metrics, LLM queue status, and TTS warmup/cache cleanup status. |
 | `GET /api/environment` | Local time-zone and locale context. |
 | `POST /api/environment` | Update local time-zone and locale context. |
 | `GET /api/taste` | Static taste file. |

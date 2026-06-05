@@ -2901,7 +2901,14 @@ function handleWsMessage(msg) {
     serverSessionActive = true;
     currentProgramId = msg.programId || currentProgramId;
     autoRefilling = false;
-    if (msg.tracks?.length) enqueueAndPlay(msg.tracks, { autoPlay: !msg.tail });
+    if (msg.tracks?.length) {
+      enqueueAndPlay(msg.tracks, { autoPlay: !msg.tail });
+    } else if (awaitingNextTrack) {
+      setRadioStatus('On Air');
+      setTimeout(() => {
+        if (awaitingNextTrack && !autoRefilling) maybeRefillAhead();
+      }, REFILL_BACKOFF_MS + 250);
+    }
     renderStationContext();
     return;
   }
