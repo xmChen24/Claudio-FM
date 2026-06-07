@@ -91,6 +91,32 @@ function coldOpenLengthInstruction(language) {
     : 'The full cold open should sound like live radio, use concrete musical detail, and stay around 45-90 English words across all cold_open parts.';
 }
 
+function coldOpenRadioHostInstruction(language) {
+  if (normalizeDjLanguage(language) === 'zh') {
+    return [
+      'Cold open voice: 像真人电台主持人开麦，不像推荐理由、散文、影评或百科词条。',
+      '默认结构：先给一个当下时段/情绪/场景的短钩子；再给一个准确的歌曲、歌手、制作、采样、专辑语境或声音细节；最后用一句自然 handoff 进歌。',
+      '每段只做一个口播动作。不要堆形容词，不要解释算法，不要说“我为你生成/安排/推荐”。',
+      '少用抽象包装词，尤其避免反复使用：signal、room、color、light、breath、horizon、drift，以及“第一层颜色”“把房间带进去”这类空泛句式。',
+      '如果事实不确定，就讲听感、编曲、flow、hook、声线、节奏或已知的发行语境；不要编造趣事。',
+      '遇到 rap / hip-hop，优先讲一个具体角度：制作质感、采样/鼓组、flow、旋律 hook、地域/厂牌气质、职业阶段、代表性合作、公众关注点。避免八卦和未经确认的争议。',
+      '好例子：下午的速度可以往前推一点。Drake 这类半唱半说的 hook 最适合把节奏抬起来，但不把桌面掀翻。先让这首进来。',
+      '坏例子：这段信号从第一层颜色里展开，让房间被命运照亮。',
+    ].join('\n');
+  }
+
+  return [
+    'Cold open voice: write like a real radio host opening a mic break, not a recommendation paragraph, poetry caption, album review, or encyclopedia entry.',
+    'Default shape: one immediate hook tied to the moment; one accurate track/artist/production/sample/album-context or sound detail; one short handoff into the intro.',
+    'Each segment should do one on-air job. Do not stack adjectives, explain the algorithm, or say "I generated/chose/recommended this for you."',
+    'Avoid vague recurring AI imagery and filler, especially: signal, room, color, light, breath, horizon, drift, first color, let the room, kind of, a little.',
+    'If a fact is uncertain, describe sound, arrangement, flow, hook, vocal texture, rhythm, or known release context instead of inventing trivia.',
+    'For rap / hip-hop, prefer one concrete angle: production texture, sample feel, drums, flow, melodic hook, regional scene, career phase, notable collaboration, public focus, or why that rapper is being watched. Avoid gossip and unverified controversy.',
+    'Good example: "Saturday afternoon can use a beat with some forward lean. Drake keeps this one half-sung and close to the hook, so it moves without crowding the room. Let it ride."',
+    'Bad example: "This signal opens inside a room of shadow and color, where emotion becomes motion."',
+  ].join('\n');
+}
+
 function bridgeLengthInstruction(language) {
   return normalizeDjLanguage(language) === 'zh'
     ? 'Bridge segments should be brief and conversational, usually 18-55 Chinese characters total. Silence segments are valid deliberate choices.'
@@ -130,6 +156,7 @@ function buildPrompt(userInput, queueState = '', options = {}) {
       'Return "segments" as an array of radio script actions. Supported types: cold_open, bridge, quick_touch, back_announce, silence. Supported positions: before_track, between_tracks, after_track, immediate.',
       'For normal music sets, include a cold open before trackIndex 0 unless silence is clearly better. Write it as 2–4 consecutive cold_open segments, each with one sentence, the same position/trackIndex, and optional part values: anchor, heart, turn, invitation.',
       coldOpenLengthInstruction(djLanguage),
+      coldOpenRadioHostInstruction(djLanguage),
       `Bridge segments should be bound between tracks with afterTrackIndex and beforeTrackIndex. ${bridgeLengthInstruction(djLanguage)}`,
       'Vary your rhythm: do not narrate every track the same way. If your recent on-air lines in the dialog history were long, keep this one short or silent. The music is the point; your voice frames it.',
       '{"title":"program moment name","play":["song - artist"],"segments":[{"type":"cold_open","part":"anchor","position":"before_track","trackIndex":0,"text":"One sentence of DJ narration."},{"type":"cold_open","part":"turn","position":"before_track","trackIndex":0,"text":"One sentence that continues the opening."},{"type":"cold_open","part":"invitation","position":"before_track","trackIndex":0,"text":"One short sentence into the music."},{"type":"bridge","position":"between_tracks","afterTrackIndex":0,"beforeTrackIndex":1,"text":"bridge over track 1 outro into track 2"},{"type":"silence","position":"between_tracks","afterTrackIndex":1,"beforeTrackIndex":2,"text":""}],"reason":"internal reason"}',
@@ -167,6 +194,7 @@ function buildProgramStartPrompt(userInput, queueState = '', options = {}) {
       'If correction context is present, recover from the rejected lane and do not choose the rejected current track or artist unless explicitly required.',
       'The cold_open must introduce play[0] specifically. If you mention a title or artist, it must come from play[0].',
       coldOpenLengthInstruction(djLanguage),
+      coldOpenRadioHostInstruction(djLanguage),
       'Do not say "This is Claudio", "coming up next", "let me", "okay", or explain that you are generating a program.',
       '{"title":"program moment name","say":"","play":["song - artist","song - artist"],"segments":[{"type":"cold_open","groupId":"open_0","part":"anchor","position":"before_track","trackIndex":0,"text":"One sentence about play[0]."},{"type":"cold_open","groupId":"open_0","part":"turn","position":"before_track","trackIndex":0,"text":"One sentence that develops the opening."},{"type":"cold_open","groupId":"open_0","part":"invitation","position":"before_track","trackIndex":0,"text":"One short sentence into the first track."}],"intros":[],"reason":"internal reason","mode":"program_start"}',
     ].join('\n'),
@@ -213,6 +241,7 @@ function buildColdOpenForTracksPrompt({ programTitle = '', tracks = [], userInpu
         ? 'This is a direct listener request with the song already resolved. Do not plan a broader set; focus on why this exact confirmed song fits the request.'
         : 'Keep the opening connected to the broader program arc without drifting away from the first confirmed track.',
       coldOpenLengthInstruction(normalizedLanguage),
+      coldOpenRadioHostInstruction(normalizedLanguage),
       'Use optional part values: anchor, heart, turn, image, invitation.',
       '{"segments":[{"type":"cold_open","groupId":"open_0","part":"anchor","position":"before_track","trackIndex":0,"text":"One sentence about the exact first confirmed track."},{"type":"cold_open","groupId":"open_0","part":"turn","position":"before_track","trackIndex":0,"text":"One sentence that stays accurate to the confirmed tracks."},{"type":"cold_open","groupId":"open_0","part":"invitation","position":"before_track","trackIndex":0,"text":"One short sentence into the first track."}],"reason":"internal reason"}',
     ].join('\n'),
