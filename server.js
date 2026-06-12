@@ -267,7 +267,31 @@ const FALLBACK_PROGRAM_TRACKS = [
   'Pink Moon - Nick Drake',
   '1901 - Phoenix',
   'This Must Be the Place - Talking Heads',
+  'New Soul - Yael Naim',
+  'San Luis - Gregory Alan Isakov',
+  'Show Me How - Men I Trust',
+  'Lost Angel - Cleo Sol',
+  'Garden Song - Phoebe Bridgers',
+  'Cherry-coloured Funk - Cocteau Twins',
+  'Feather - Nujabes',
+  'Streetcar - Daniel Caesar',
+  'Sweet Talk - Saint Motel',
+  '日常 - Hebe Tien',
+  '慢慢喜歡你 - Karen Mok',
+  '清白之年 - Pu Shu',
+  'Left Hand Free - alt-J',
+  'Everybody Wants To Rule The World - Tears For Fears',
+  'A Long Walk - Jill Scott',
+  'Northern Sky - Nick Drake',
+  "Friday I'm in Love - The Cure",
+  'The High Road - Broken Bells',
+  'Sea Gets Hotter - Durand Jones & The Indications',
+  'Space Song - Beach House',
+  'La La Lost You - NIKI',
+  'Plastic Love - Mariya Takeuchi',
+  'Golden Hour - Kacey Musgraves',
 ];
+const FALLBACK_PROGRAM_TRACK_COUNT = 5;
 const SPOTIFY_SCOPES = [
   'streaming',
   'user-read-email',
@@ -454,7 +478,7 @@ function fallbackProgramStartResult(job = {}, reason = '') {
   const isZh = djLanguage === 'zh';
   return {
     title: isZh ? '午夜备用信号' : 'Emergency Night Signal',
-    play: FALLBACK_PROGRAM_TRACKS,
+    play: pickFallbackProgramTracks(),
     segments: isZh ? [
       {
         type: 'cold_open',
@@ -462,7 +486,7 @@ function fallbackProgramStartResult(job = {}, reason = '') {
         part: 'anchor',
         position: 'before_track',
         trackIndex: 0,
-        text: 'Claudio 先从一组稳定的夜间歌单开始，把信号慢慢打开。',
+        text: 'Claudio 先从一组稳定的夜间歌单开始，把节奏慢慢接上。',
       },
       {
         type: 'cold_open',
@@ -470,7 +494,7 @@ function fallbackProgramStartResult(job = {}, reason = '') {
         part: 'invitation',
         position: 'before_track',
         trackIndex: 0,
-        text: '把音量放低一点，我们继续在空中发射。',
+        text: '把音量放低一点，先让第一首歌进来。',
       },
     ] : [
       {
@@ -479,7 +503,7 @@ function fallbackProgramStartResult(job = {}, reason = '') {
         part: 'anchor',
         position: 'before_track',
         trackIndex: 0,
-        text: 'Claudio is opening with a steady night set while the signal settles in.',
+        text: 'Claudio is opening with a steady night set while the clock settles down.',
       },
       {
         type: 'cold_open',
@@ -487,11 +511,44 @@ function fallbackProgramStartResult(job = {}, reason = '') {
         part: 'invitation',
         position: 'before_track',
         trackIndex: 0,
-        text: 'Keep it low and let the station drift back into the sky.',
+        text: 'Keep it low and let the first record take it from here.',
       },
     ],
     reason: reason ? `fallback: ${reason}` : 'fallback program start',
   };
+}
+
+function shuffled(values = []) {
+  const copy = [...values];
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = crypto.randomInt(i + 1);
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy;
+}
+
+function fallbackTrackFromQuery(query) {
+  const parsed = parseRequestedTrack(query);
+  return {
+    query,
+    title: parsed.title || query,
+    artist: parsed.artist || '',
+  };
+}
+
+function pickFallbackProgramTracks() {
+  const candidates = shuffled(FALLBACK_PROGRAM_TRACKS);
+  const avoidState = createTrackAvoidState();
+  const fresh = [];
+  const backup = [];
+
+  for (const query of candidates) {
+    const skip = shouldSkipTrack(fallbackTrackFromQuery(query), avoidState);
+    if (skip.skip) backup.push(query);
+    else fresh.push(query);
+  }
+
+  return [...fresh, ...backup].slice(0, FALLBACK_PROGRAM_TRACK_COUNT);
 }
 
 function directMusicFailureResult(job = {}, failedTracks = []) {
@@ -682,14 +739,14 @@ function fallbackOpeningLeadIn(firstTrack, djLanguage = 'en') {
   const label = artist ? `${title} — ${artist}` : title;
   const variants = normalizeDjLanguage(djLanguage) === 'zh'
     ? [
-      label ? `先让 ${label} 把这段信号点亮。` : '先把这段信号轻轻打开。',
-      label ? `从 ${label} 的第一层颜色进来。` : '从第一层声音慢慢进来。',
-      label ? `${label} 会先把房间带进去。` : '让第一首歌先把房间带进去。',
+      label ? `先用 ${label} 把这段时间接住。` : '先让第一首歌把节奏接住。',
+      label ? `${label} 的开头不用多讲，听鼓点先进来。` : '开头不用多讲，听第一拍先进来。',
+      label ? `从 ${label} 开始，先把速度稳住。` : '先把速度稳住，再往前走。',
     ]
     : [
-      label ? `${label} is where this signal first finds its shape.` : 'The signal opens with a little room to breathe.',
-      label ? `We start inside the first color of ${label}.` : 'We start with the first color of the room.',
-      label ? `${label} gets the room first.` : 'The first record gets the room first.',
+      label ? `${label} is the first record on the desk.` : 'The first record starts this one clean.',
+      label ? `Start with ${label}; the opening does enough on its own.` : 'Start clean and let the first beat do the work.',
+      label ? `${label} gets us moving first.` : 'Let the first record get us moving.',
     ];
   const index = Math.abs(hashText(label || String(Date.now()))) % variants.length;
   return variants[index];
@@ -765,11 +822,11 @@ function fallbackBridgeResult(job = {}) {
 
   const text = djLanguage === 'zh'
     ? sameArtist
-      ? `${before.artist} 的线索还在，下一首换一层光。`
-      : `刚才的余温留住一点，${beforeLabel} 接住下一段。`
+      ? `${before.artist} 还在这条线上，下一首换个角度。`
+      : `刚才的尾音留一下，${beforeLabel} 接住下一段。`
     : sameArtist
-      ? `${before.artist} stays in the room, just under a different light.`
-      : `Let that last color hang; ${beforeLabel} takes it from here.`;
+      ? `${before.artist} stays in the lane, but the next one turns the wheel a bit.`
+      : `Let that last fade sit for a second; ${beforeLabel} takes it from here.`;
 
   return {
     segments: [{
@@ -1075,6 +1132,18 @@ function normalizeTracksForPrompt(tracks = []) {
     title: track.title || track.query || '',
     artist: track.artist || '',
   }));
+}
+
+function normalizeClientNowPlaying(track) {
+  if (!track || typeof track !== 'object') return null;
+  const title = String(track.title || track.query || '').trim();
+  if (!title) return null;
+  return {
+    query: String(track.query || trackLabel(track)).trim(),
+    title,
+    artist: String(track.artist || '').trim(),
+    startedAt: Number(track.startedAt) || Date.now(),
+  };
 }
 
 async function resolveRequestedTracks(requestedTracks, options = {}) {
@@ -1590,7 +1659,13 @@ async function runProgramStartJob(job) {
   if (!tracks.length && !directRequestFailed) {
     console.warn('[program_start] No playable tracks from generated set; using fallback set.');
     const fallbackResult = fallbackProgramStartResult(job, 'no playable generated tracks');
-    const fallbackResolved = await resolveFirstPlayableTrack(fallbackResult.play, { enforceAvoidance: false, musicProvider: job.musicProvider });
+    let fallbackResolved = await resolveFirstPlayableTrack(fallbackResult.play, { musicProvider: job.musicProvider });
+    if (!fallbackResolved.tracks.length) {
+      console.warn('[program_start] Fallback set was fully filtered; retrying fallback without cooldown as last resort.');
+      const relaxedFallbackResult = fallbackProgramStartResult(job, 'no fresh playable generated tracks');
+      fallbackResolved = await resolveFirstPlayableTrack(relaxedFallbackResult.play, { enforceAvoidance: false, musicProvider: job.musicProvider });
+      fallbackResult.play = relaxedFallbackResult.play;
+    }
     if (fallbackResolved.tracks.length) {
       result = fallbackResult;
       tracks = fallbackResolved.tracks;
@@ -2051,7 +2126,8 @@ async function runRadioSegment(userInput, intent = {}, skipHistory = false) {
   console.log(`[电台] 输入: "${userInput.slice(0, 80)}${userInput.length > 80 ? '…' : ''}"`);
 
   if (!skipHistory) addMessage('user', userInput);
-  const prompt = buildPrompt(userInput, nowPlaying ? JSON.stringify(nowPlaying) : '', {
+  const promptNowPlaying = intent.nowPlaying || nowPlaying;
+  const prompt = buildPrompt(userInput, promptNowPlaying ? JSON.stringify(promptNowPlaying) : '', {
     mode: intent.mode,
     userIntent: intent.userIntent,
     musicRequest: intent.musicRequest,
@@ -2123,6 +2199,7 @@ app.post('/api/chat', async (req, res) => {
   if (!message) return res.status(400).json({ error: 'message required' });
 
   const intent = route(message);
+  const requestNowPlaying = normalizeClientNowPlaying(req.body?.nowPlaying) || nowPlaying;
   const requestSource = autoRefill ? 'autoRefill' : autoStart ? 'autoStart' : 'user';
   if (!autoRefill && !autoStart) {
     stationState.lastUserRequestAt = Date.now();
@@ -2132,12 +2209,13 @@ app.post('/api/chat', async (req, res) => {
   intent.djLanguage = normalizeDjLanguage(djLanguage);
   intent.hostMode = normalizeHostMode(hostMode);
   intent.musicProvider = normalizeMusicProvider(musicProvider);
+  intent.nowPlaying = requestNowPlaying;
   if (autoStart) {
     intent.mode = 'music';
     intent.userIntent = 'vibe_request';
     intent.musicRequest = null;
   }
-  const personalizationSignals = captureUserSignal(message, intent, nowPlaying);
+  const personalizationSignals = captureUserSignal(message, intent, requestNowPlaying);
   if (personalizationSignals?.length) {
     intent.personalizationSignals = personalizationSignals;
     console.log(`[dj-memory] ${personalizationSignals.join(', ')}`);
@@ -2162,7 +2240,7 @@ app.post('/api/chat', async (req, res) => {
 
   if (intent.userIntent === 'correction' && !autoRefill) {
     const correctionContext = buildCorrectionContext(message, {
-      nowPlaying,
+      nowPlaying: requestNowPlaying,
       tracks: stationState.tracks,
       lastMusicIntent: stationState.lastMusicIntent,
     });
@@ -2391,10 +2469,10 @@ app.post('/api/spotify/play', async (req, res) => {
 
     const deviceId = typeof req.body?.deviceId === 'string' ? req.body.deviceId : '';
     const uri = typeof req.body?.uri === 'string' ? req.body.uri : '';
-    if (!deviceId || !uri) return res.status(400).json({ error: 'deviceId and uri required' });
+    if (!uri) return res.status(400).json({ error: 'uri required' });
 
     const url = new URL('https://api.spotify.com/v1/me/player/play');
-    url.searchParams.set('device_id', deviceId);
+    if (deviceId) url.searchParams.set('device_id', deviceId);
     const apiRes = await fetch(url, {
       method: 'PUT',
       headers: {

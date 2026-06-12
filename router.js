@@ -4,7 +4,11 @@ const RESUME_PATTERNS = /^(继续|resume|play|播放)$/i;
 const VOL_UP = /^(大声|音量大|louder|vol\s*up)$/i;
 const VOL_DOWN = /^(小声|音量小|quieter|vol\s*down)$/i;
 const SPEECH_ONLY_PATTERNS = /(测试.*声音|不要换歌|别换歌|不换歌|介绍当前|介绍一下当前|随便说两句|只说话|no\s*music|speech\s*only|what'?s playing)/i;
-const VIBE_COMMAND_PATTERNS = /^(?:more\s+like\s+this|change\s+the\s+vibe|keep\s+the\s+next\s+set|retune\b|换.*(?:氛围|风格)|更多类似)/i;
+const WHY_CURRENT_TRACK_PATTERNS = /(why\s+this\s+(?:track|song)|为什么.*(?:这首|这歌|当前|刚才)|为什么放)/i;
+const SAVE_VIBE_PATTERNS = /(保存这个氛围|记住这个氛围|这个氛围不错|save this vibe|remember this vibe|save the vibe)/i;
+const AVOID_ARTIST_PATTERNS = /(?:别播|不要播|不想听|don't play|do not play)\s*[^，。,.!?！？]{2,60}/i;
+const VIBE_COMMAND_PATTERNS = /^(?:more\s+like\s+this|less\s+like\s+this|change\s+the\s+vibe|keep\s+the\s+next\s+set|retune\b|换.*(?:氛围|风格)|更多类似)/i;
+const STATION_START_PATTERNS = /you['’]?re\s+on\s+air.*open\s+the\s+station|open\s+the\s+station.*pick\s+whatever\s+fits\s+the\s+moment/i;
 const GENERAL_MUSIC_PATTERNS = /(start|open|retune|change\s+the\s+vibe|more\s+like|keep\s+the\s+next\s+set|pick\s+whatever|radio|station|playlist|^\s*(?:some\s+)?(?:music|songs?|tracks?)\s*$|vibe|mood|开播|开始|电台|换.*氛围|换.*风格|更多类似|歌单|(?:我想听|想听|来一首|来点|放点|播放|换|点播).*(?:歌|音乐|歌曲|氛围)|氛围|适合|工作|学习|睡觉|放松|提神|通勤|深夜|早晨|早上|下午|夜晚)/i;
 const CONVERSATION_PATTERNS = /([?？]|为什么|怎么|如何|什么|你觉得|你认为|能不能解释|解释一下|聊聊|说说|告诉我|回答我|\b(hello|hi|hey|thanks|thank you|why|how|what|who)\b|tell me|explain|do you think|can you answer)/i;
 const EN_TRACK_BY_ARTIST = /^(?:play|put on|listen to|i want to hear|i wanna hear|can you play|please play)\s+(.+?)\s+by\s+(.+?)\s*$/i;
@@ -83,7 +87,7 @@ function parseMusicRequest(message) {
   }
 
   const cleanedBare = cleanRequestTarget(msg);
-  if (cleanedBare && cleanedBare !== msg && !GENERIC_MUSIC_QUERY.test(cleanedBare)) {
+  if (cleanedBare && cleanedBare !== msg && cleanedBare.length <= 80 && cleanedBare.split(/\s+/).length <= 6 && !BARE_NON_REQUEST_WORDS.test(cleanedBare) && !GENERIC_MUSIC_QUERY.test(cleanedBare)) {
     return { kind: 'unknown', query: cleanedBare, title: cleanedBare, prefer: 'track', userIntent: 'direct_music_request' };
   }
 
@@ -120,6 +124,9 @@ function route(message) {
   if (RESUME_PATTERNS.test(msg)) return { action: 'resume' };
   if (VOL_UP.test(msg)) return { action: 'volume', delta: +10 };
   if (VOL_DOWN.test(msg)) return { action: 'volume', delta: -10 };
+  if (WHY_CURRENT_TRACK_PATTERNS.test(msg)) return { action: 'claude', message: msg, mode: 'speech-only', userIntent: 'current_track_question' };
+  if (SAVE_VIBE_PATTERNS.test(msg)) return { action: 'claude', message: msg, mode: 'speech-only', userIntent: 'vibe_memory' };
+  if (AVOID_ARTIST_PATTERNS.test(msg)) return { action: 'claude', message: msg, mode: 'speech-only', userIntent: 'negative_feedback' };
   if (SPEECH_ONLY_PATTERNS.test(msg)) return { action: 'claude', message: msg, mode: 'speech-only', userIntent: 'speech_only' };
   if (CORRECTION_PATTERNS.test(msg)) return { action: 'claude', message: msg, mode: 'speech-only', userIntent: 'correction' };
   if (NEGATIVE_FEEDBACK_PATTERNS.test(msg)) return { action: 'claude', message: msg, mode: 'speech-only', userIntent: 'negative_feedback' };
@@ -127,6 +134,7 @@ function route(message) {
   if (HOST_STYLE_PATTERNS.test(msg)) return { action: 'claude', message: msg, mode: 'speech-only', userIntent: 'host_style_feedback' };
   if (SESSION_CONTEXT_PATTERNS.test(msg)) return { action: 'claude', message: msg, mode: 'speech-only', userIntent: 'session_context' };
   if (VIBE_COMMAND_PATTERNS.test(msg)) return { action: 'claude', message: msg, mode: 'music', musicRequest: null, userIntent: 'vibe_request' };
+  if (STATION_START_PATTERNS.test(msg)) return { action: 'claude', message: msg, mode: 'music', musicRequest: null, userIntent: 'vibe_request' };
   const musicRequest = parseMusicRequest(msg);
   if (musicRequest) return { action: 'claude', message: msg, mode: 'music', musicRequest, userIntent: musicRequest.userIntent };
   if (CONVERSATION_PATTERNS.test(msg)) return { action: 'claude', message: msg, mode: 'speech-only', userIntent: 'conversation' };

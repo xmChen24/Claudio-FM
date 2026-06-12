@@ -558,6 +558,7 @@ html, body {
 }
 .action-row {
   justify-content: flex-end;
+  flex-wrap: wrap;
 }
 .session-card {
   grid-column: 1 / 2;
@@ -1358,6 +1359,16 @@ function sessionTrackLabel(track) {
   return track.artist ? `${title} - ${track.artist}` : title;
 }
 
+function clientNowPlayingPayload() {
+  const track = queue[queueIdx];
+  if (!track) return null;
+  return {
+    query: track.query || sessionTrackLabel(track),
+    title: track.title || track.query || '',
+    artist: track.artist || '',
+  };
+}
+
 function renderSessionCard({ signal = currentSignalState } = {}) {
   if (!sessionCard) return;
   const title = sessionTitleEl.textContent || 'Untitled signal';
@@ -1410,6 +1421,42 @@ function cancelAutoStart() {
 function markUserPlaybackIntent() {
   userPlaybackIntentSeen = true;
   cancelAutoStart();
+}
+
+function voicePlaybackNeedsGesture() {
+  return voiceObjectActive && ttsAudio.src && ttsAudio.paused && !ttsAudio.ended;
+}
+
+function isVoicePlaybackBlocked(err) {
+  const message = String(err?.message || '');
+  return err?.name === 'NotAllowedError' ||
+    /play\(\) failed|user.*interact|notallowed|gesture|autoplay/i.test(message);
+}
+
+function waitForVoiceGesture(err, { continueWithoutVoice = false } = {}) {
+  console.warn('[tts-playback] waiting for user gesture', err);
+  if (continueWithoutVoice) {
+    setStationNotice('Browser blocked DJ voice; starting the music instead.');
+    setRadioStatus('On Air');
+  } else {
+    setStationNotice('Tap play to hear the DJ voice before the music starts.');
+    setRadioStatus('Paused');
+  }
+}
+
+function resumePendingVoicePlayback() {
+  if (!voicePlaybackNeedsGesture()) return false;
+  setStationNotice('');
+  ttsAudio.play().catch(err => {
+    if (isVoicePlaybackBlocked(err)) {
+      waitForVoiceGesture(err);
+      return;
+    }
+    console.error('[tts-playback-resume]', err);
+    afterTtsFinished();
+    ttsAudio.dispatchEvent(new Event('error'));
+  });
+  return true;
 }
 
 function stationHasPlaybackIntent() {
@@ -1699,6 +1746,34 @@ function scheduleSpotifyEnd() {
   spotifyProgressTimer = setInterval(updateSpotifyProgressUi, 1000);
 }
 
+async function requestSpotifyPlayback(uri, deviceId = '') {
+  const body = { uri };
+  if (deviceId) body.deviceId = deviceId;
+  await fetch('/api/spotify/play', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }).then(async res => {
+    if (!res.ok) throw new Error(await res.text());
+  });
+}
+
+function beginSpotifyPlaybackState(track, { remote = false } = {}) {
+  musicAudio.pause();
+  musicAudio.removeAttribute('src');
+  musicAudio.load();
+  spotifyActive = true;
+  spotifyPaused = false;
+  spotifyTrackDurationMs = Number(track.durationMs || 0);
+  spotifyTrackPositionMs = 0;
+  spotifyTrackStartedAt = Date.now();
+  setStationNotice(remote ? 'Playing on active Spotify device' : '');
+  setPlaybackVolume((!ttsAudio.paused && !ttsAudio.ended) ? duckedMusicVolume() : baseMusicVolume);
+  setPlaying(true);
+  updateSpotifyProgressUi();
+  scheduleSpotifyEnd();
+}
+
 function waitForSpotifyReady(timeoutMs = 4500) {
   if (spotifyReady && spotifyDeviceId) return Promise.resolve(true);
   return new Promise(resolve => {
@@ -1806,7 +1881,22 @@ function initSpotifyPlayerWhenReady() {
 window.onSpotifyWebPlaybackSDKReady = initSpotifyPlayerWhenReady;
 if (window.Spotify) initSpotifyPlayerWhenReady();
 
-musicAudio.addEventListener('play',  () => setPlaying(true));
+function handleMusicPlayError(err) {
+  console.error('[music-playback]', err);
+  if (isVoicePlaybackBlocked(err)) {
+    setStationNotice('Browser blocked playback. Tap play once to unlock audio.');
+    setPlaying(false);
+  }
+}
+
+function playMusicElement() {
+  return musicAudio.play().catch(handleMusicPlayError);
+}
+
+musicAudio.addEventListener('play',  () => {
+  setStationNotice('');
+  setPlaying(true);
+});
 musicAudio.addEventListener('pause', () => setPlaying(false));
 musicAudio.addEventListener('ended', () => {
   const token = currentPlaybackToken;
@@ -1865,6 +1955,7 @@ musicAudio.addEventListener('timeupdate', () => {
 
 playBtn.addEventListener('click', async () => {
   markUserPlaybackIntent();
+  if (resumePendingVoicePlayback()) return;
   if (spotifyActive && spotifyPlayer) {
     spotifyPlayer.togglePlay().catch(console.error);
     return;
@@ -1875,7 +1966,7 @@ playBtn.addEventListener('click', async () => {
     return;
   }
   if (musicAudio.src && musicAudio.paused && !musicAudio.ended) {
-    musicAudio.play().catch(console.error);
+    playMusicElement();
     return;
   }
   if (musicAudio.src && musicAudio.ended && playNext()) return;
@@ -2290,10 +2381,18 @@ function findSegments(matchFn) {
 function speakSegmentObject(segment, onEnd) {
   return new Promise(resolve => {
     let settled = false;
+    let handled = false;
+    const markHandled = () => {
+      if (handled) return;
+      handled = true;
+      markSegmentHandled(segment);
+    };
     const finish = () => {
       if (settled) return;
       settled = true;
+      markHandled();
       voiceObjectActive = false;
+      ttsAudio.removeEventListener('play', markHandled);
       ttsAudio.removeEventListener('ended', finish);
       ttsAudio.removeEventListener('error', finish);
       if (onEnd) onEnd();
@@ -2303,7 +2402,6 @@ function speakSegmentObject(segment, onEnd) {
 
     if (!segment) { finish(); return; }
     if (wasSegmentHandled(segment)) { finish(); return; }
-    markSegmentHandled(segment);
 
     if (segment.type === 'silence' || !segment.text) {
       finish();
@@ -2318,9 +2416,15 @@ function speakSegmentObject(segment, onEnd) {
     lastReplaySegment = segment;
     voiceObjectActive = true;
     ttsAudio.src = segment.ttsUrl;
+    ttsAudio.addEventListener('play', markHandled, { once: true });
     ttsAudio.addEventListener('ended', finish, { once: true });
     ttsAudio.addEventListener('error', finish, { once: true });
-    ttsAudio.play().catch(err => {
+    ttsAudio.play().then(markHandled).catch(err => {
+      if (isVoicePlaybackBlocked(err)) {
+        waitForVoiceGesture(err, { continueWithoutVoice: true });
+        finish();
+        return;
+      }
       console.error(err);
       afterTtsFinished();
       finish();
@@ -2650,29 +2754,22 @@ async function playTrack(track) {
   }
   if (track.spotifyUri && spotifyReady && spotifyDeviceId) {
     try {
-      musicAudio.pause();
-      musicAudio.removeAttribute('src');
-      musicAudio.load();
-      spotifyActive = true;
-      spotifyPaused = false;
-      spotifyTrackDurationMs = Number(track.durationMs || 0);
-      spotifyTrackPositionMs = 0;
-      spotifyTrackStartedAt = Date.now();
-      setStationNotice('');
-      await fetch('/api/spotify/play', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ deviceId: spotifyDeviceId, uri: track.spotifyUri }),
-      }).then(async res => {
-        if (!res.ok) throw new Error(await res.text());
-      });
-      setPlaybackVolume((!ttsAudio.paused && !ttsAudio.ended) ? duckedMusicVolume() : baseMusicVolume);
-      setPlaying(true);
-      updateSpotifyProgressUi();
-      scheduleSpotifyEnd();
+      beginSpotifyPlaybackState(track);
+      await requestSpotifyPlayback(track.spotifyUri, spotifyDeviceId);
       return;
     } catch (err) {
       console.warn('[spotify-playback] falling back to audio stream', err);
+      spotifyActive = false;
+      clearSpotifyTimers();
+    }
+  }
+  if (track.spotifyUri && (!spotifyReady || !spotifyDeviceId)) {
+    try {
+      beginSpotifyPlaybackState(track, { remote: true });
+      await requestSpotifyPlayback(track.spotifyUri);
+      return;
+    } catch (err) {
+      console.warn('[spotify-playback] active-device fallback failed', err);
       spotifyActive = false;
       clearSpotifyTimers();
     }
@@ -2694,13 +2791,7 @@ async function playTrack(track) {
   musicAudio.src = track.streamUrl;
   currentAudioSrc = musicAudio.currentSrc || track.streamUrl;
   setPlaybackVolume((!ttsAudio.paused && !ttsAudio.ended) ? duckedMusicVolume() : baseMusicVolume);
-  musicAudio.play().catch(err => {
-    console.error(err);
-    if (err?.name === 'NotAllowedError') {
-      setStationNotice('Browser blocked autoplay. Tap play once to unlock audio.');
-      setPlaying(false);
-    }
-  });
+  playMusicElement();
 }
 
 function playNext(reason = 'unknown', token = currentPlaybackToken) {
@@ -2799,8 +2890,9 @@ function enqueueAndPlay(tracks, { autoPlay = true } = {}) {
 
 function setRetuneControls(active) {
   retuningStation = active;
-  if (moreLikeBtn) moreLikeBtn.disabled = active;
-  if (changeVibeBtn) changeVibeBtn.disabled = active;
+  [moreLikeBtn, changeVibeBtn]
+    .filter(Boolean)
+    .forEach(btn => { btn.disabled = active; });
 }
 
 function programStartSegmentsForCurrentQueue(msg) {
@@ -3122,7 +3214,7 @@ function handleWsMessage(msg) {
     }
     if (msg.action === 'resume') {
       if (spotifyActive && spotifyPlayer) spotifyPlayer.resume().catch(console.error);
-      else musicAudio.play().catch(console.error);
+      else playMusicElement();
     }
     if (msg.action === 'volume') {
       setMusicVolume(baseMusicVolume + msg.delta / 100);
@@ -3139,7 +3231,7 @@ async function requestChat(message, { showUserTurn = true, autoStart = false } =
   const res = await fetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message, djLanguage, musicProvider: requestMusicProvider, autoStart }),
+    body: JSON.stringify({ message, djLanguage, musicProvider: requestMusicProvider, autoStart, nowPlaying: clientNowPlayingPayload() }),
   });
   if (!res.ok) throw new Error(await res.text());
   const body = await res.json().catch(() => ({}));
@@ -3152,19 +3244,46 @@ async function requestChat(message, { showUserTurn = true, autoStart = false } =
 async function requestVibeShift(kind) {
   markUserPlaybackIntent();
   if (startingRadio || retuningStation) return;
-  setRetuneControls(true);
   const current = queue[queueIdx];
   const currentText = current ? sessionTrackLabel(current) : 'the current station mood';
-  const message = kind === 'more'
-    ? `More like this: keep the next set close to ${currentText}, but avoid repeating the same artist.`
-    : `Change the vibe: move away from ${currentText} and retune the station in a fresh direction.`;
-  addSystemLine(kind === 'more' ? 'Tuning more like this…' : 'Changing the station vibe…');
+  const currentArtist = current?.artist || '';
+  let message = '';
+  let systemLine = '';
+  if (kind === 'more') {
+    message = `More like this: keep the next set close to ${currentText}, but avoid repeating the same artist.`;
+    systemLine = 'Tuning more like this…';
+  } else if (kind === 'less') {
+    message = `Less like this: move away from ${currentText}. The current track did not fit, but keep the transition smooth.`;
+    systemLine = 'Tuning away from this lane…';
+  } else if (kind === 'avoid-artist') {
+    if (!currentArtist) {
+      addSystemLine('No current artist to avoid yet');
+      return;
+    }
+    message = `Do not play ${currentArtist}. Avoid this artist in future sets. Do not change the music.`;
+    systemLine = `Saving artist block: ${currentArtist}`;
+  } else if (kind === 'why') {
+    message = current
+      ? `Why this track? Briefly explain why ${currentText} fits the current station moment. Do not change the music.`
+      : 'Why this station direction? Briefly explain the current station moment. Do not change the music.';
+    systemLine = 'Asking Claudio why…';
+  } else if (kind === 'save') {
+    message = current
+      ? `Save this vibe: ${currentText}. Remember this kind of set for later. Do not change the music.`
+      : 'Save this vibe. Remember this kind of set for later. Do not change the music.';
+    systemLine = 'Saving this vibe…';
+  } else {
+    message = `Change the vibe: move away from ${currentText} and retune the station in a fresh direction.`;
+    systemLine = 'Changing the station vibe…';
+  }
+  setRetuneControls(true);
+  addSystemLine(systemLine);
   try {
     const result = await requestChat(message, { showUserTurn: true });
     if (!result?.queued) setRetuneControls(false);
   } catch (err) {
     console.error('[vibe-shift]', err);
-    addSystemLine('Could not retune Claudio FM');
+    addSystemLine('Could not reach Claudio FM');
     setRetuneControls(false);
   }
 }

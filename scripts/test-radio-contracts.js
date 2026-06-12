@@ -53,6 +53,8 @@ assert.doesNotMatch(context, /Return only: title, play, openingLeadIn, reason/);
 assert.doesNotMatch(context, /buildOpeningLeadInPrompt/);
 assert.match(context, /2-4 cold_open segments/);
 assert.match(context, /directRequest \? 6 : 12/);
+assert.match(context, /Subjective listening layer/);
+assert.match(context, /Do not invent the DJ’s real-life biography/);
 
 assert.match(fs.readFileSync(path.join(root, 'llm.js'), 'utf8'), /provider === 'codex_cli'/);
 const tts = fs.readFileSync(path.join(root, 'tts.js'), 'utf8');
@@ -114,7 +116,7 @@ assert.match(pwa, /bufferProgramHandoffMessage\(msg, 'segmentReady'\)/);
 assert.match(pwa, /const refillMusicProvider = normalizeMusicProvider\(activeProgramMusicProvider \|\| musicProvider\)/);
 assert.doesNotMatch(pwa, /api\/netease/);
 assert.doesNotMatch(pwa, /musicProviderControl/);
-assert.match(pwa, /body: JSON\.stringify\(\{ message, djLanguage, musicProvider: requestMusicProvider, autoStart \}\)/);
+assert.match(pwa, /body: JSON\.stringify\(\{ message, djLanguage, musicProvider: requestMusicProvider, autoStart, nowPlaying: clientNowPlayingPayload\(\) \}\)/);
 assert.match(pwa, /musicProvider: refillMusicProvider/);
 assert.match(pwa, /await syncSessionState\(\);/);
 assert.match(pwa, /if \(!musicIsPlaying\(\) && !awaitingNextTrack\) return;/);

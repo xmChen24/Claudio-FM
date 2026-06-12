@@ -14,7 +14,30 @@ function assertNoDirectMusicRequest(input, userIntent = 'vibe_request') {
 }
 
 assertNoDirectMusicRequest('More like this: keep the next set close to Archie, Marry Me - Alvvays, but avoid repeating the same artist');
+assertNoDirectMusicRequest('Less like this: move away from Archie, Marry Me - Alvvays');
 assertNoDirectMusicRequest("It's 14:21 on Wednesday, June 3, 2026 (America/Los_Angeles). You're on air - open the station. Pick whatever fits the moment");
+assertNoDirectMusicRequest("It's 12:22 on Sunday, June 7, 2026 (America/Los_Angeles). You're on air — open the station. Pick whatever fits the moment.");
+
+assert.deepStrictEqual(route('Save this vibe: Archie, Marry Me - Alvvays'), {
+  action: 'claude',
+  message: 'Save this vibe: Archie, Marry Me - Alvvays',
+  mode: 'speech-only',
+  userIntent: 'vibe_memory',
+});
+
+assert.deepStrictEqual(route('Why this track?'), {
+  action: 'claude',
+  message: 'Why this track?',
+  mode: 'speech-only',
+  userIntent: 'current_track_question',
+});
+
+assert.deepStrictEqual(route('Do not play Drake. Avoid this artist in future sets. Do not change the music.'), {
+  action: 'claude',
+  message: 'Do not play Drake. Avoid this artist in future sets. Do not change the music.',
+  mode: 'speech-only',
+  userIntent: 'negative_feedback',
+});
 
 assert.deepStrictEqual(musicRequest('播放周杰伦的晴天'), {
   kind: 'track',

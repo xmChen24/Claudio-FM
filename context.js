@@ -78,6 +78,46 @@ function hostModeInstruction(mode) {
   return 'Host mode: Story. Add concise musical context, origin, texture, or scene-setting when it helps the track feel chosen.';
 }
 
+function relationshipMemoryInstruction(language) {
+  if (normalizeDjLanguage(language) === 'zh') {
+    return [
+      'Relationship memory: 只使用明确的听众反馈和最近片刻作为小 callback；不要编造长期关系。',
+      '如果 callback 和当前歌、时段、情绪无关，就不要提。',
+      '可以像熟悉的私人 DJ 一样说一句“上次你说这类节奏适合工作”，但不要说“根据记忆系统/数据显示”。',
+      '面向一个人说话，不要用“各位听众”。',
+    ].join('\n');
+  }
+  return [
+    'Relationship memory: use only explicit listener feedback and recent moments as small callbacks; never invent a long-term relationship.',
+    'If a callback is not relevant to the current track, hour, mood, or request, leave it out.',
+    'You may sound like a familiar private DJ, e.g. "last time this lane worked for your focus block," but never mention a memory system or data.',
+    'Speak to one listener, not to a crowd.',
+  ].join('\n');
+}
+
+function subjectiveListeningInstruction(language) {
+  if (normalizeDjLanguage(language) === 'zh') {
+    return [
+      'Subjective listening layer: 可以少量使用第一人称表达 DJ 的主观听感、状态或判断，让口播像有人在听，而不是在解释推荐。',
+      '每个 cold open 或 bridge 最多用一个短的主观判断；不要每句都说“我”。',
+      '主观判断要来自可听见的东西：鼓怎么进来、hook 怎么松开、声线怎么贴近、编曲怎么推动时间。',
+      '可以温和猜测听众状态，但用条件句，不要替用户下结论：例如“你如果今天也撑得有点累，先别急着切走。”',
+      '不要编造 DJ 的真实人生经历：不要说自己在某年某地听过、买过唱片、见过艺人、参加过演出，除非 prompt 里明确给了真实上下文。',
+      '好例子：这首歌我每次听都觉得像周五晚上终于松了一口气。你如果今天也撑得有点累，先别急着切走。',
+      '坏例子：我小时候在洛杉矶第一次听到这首歌，那天雨很大。',
+    ].join('\n');
+  }
+  return [
+    'Subjective listening layer: you may use a small first-person listening take, state, or judgment so the break sounds like somebody is hearing the record, not explaining a recommendation.',
+    'Use at most one short subjective take per cold open or bridge; do not make every sentence about "I".',
+    'Ground the take in audible material: how the drums enter, how the hook loosens the hour, how the vocal sits close, how the arrangement moves time.',
+    'You may gently infer the listener state, but phrase it conditionally instead of deciding for them: "if today has been carrying too much weight, stay with this for a minute."',
+    'Do not invent the DJ’s real-life biography: no claims about hearing it in a specific place/year, buying a record, meeting an artist, attending a show, or remembering a private event unless the prompt context explicitly says so.',
+    'Good example: "I always hear this chorus like the part of Friday night where your shoulders finally drop. If today has been carrying too much weight, do not skip out of it yet."',
+    'Bad example: "I first heard this in Los Angeles when I was seventeen and it was raining."',
+  ].join('\n');
+}
+
 function djLanguageInstruction(language, scope = 'spoken segment text') {
   if (normalizeDjLanguage(language) === 'zh') {
     return `All ${scope} must be in natural, restrained Chinese. Keep song titles and artist names in their original language for accurate music search.`;
@@ -145,6 +185,8 @@ function buildPrompt(userInput, queueState = '', options = {}) {
       'Strictly output JSON only, with no extra text.',
       djLanguageInstruction(djLanguage),
       hostModeInstruction(hostMode),
+      relationshipMemoryInstruction(djLanguage),
+      subjectiveListeningInstruction(djLanguage),
       'The "title" should use the same language as the DJ narration.',
       'The "play" array may keep song titles and artist names in their original language for accurate music search.',
       'For speech-only / no-music requests, "play" must be [] and segments must not alter the queue. If the listener asks a factual or personal question, answer it directly instead of turning it into a station retune.',
@@ -184,12 +226,15 @@ function buildProgramStartPrompt(userInput, queueState = '', options = {}) {
       'Strictly output JSON only, with no extra text.',
       djLanguageInstruction(djLanguage, 'cold_open segment text'),
       hostModeInstruction(hostMode),
+      relationshipMemoryInstruction(djLanguage),
+      subjectiveListeningInstruction(djLanguage),
       'The "title" should use the same language as the DJ narration.',
       'Return only fields allowed by the JSON schema. Use title, play, segments, reason, mode, say, and intros. Keep say "" and intros [].',
       'The "play" array must contain 2-3 songs in "song title - artist" format. Keep original-language titles/artists for search.',
       'The "segments" array must contain 2-4 cold_open segments for play[0], each one sentence, position before_track, trackIndex 0, groupId "open_0".',
       'Do not repeat any song from the recent play history or current queue. Do not include the same song twice in one play array.',
       'Avoid artists that appear in the most recent 5 played songs unless the listener explicitly asked for that artist.',
+      'Vary startup selections across sessions. Do not default to the same safe radio standards; when several tracks fit, choose a less recently used lane.',
       'Use dynamic DJ memory as taste and tone guidance, but do not mention the memory system.',
       'If correction context is present, recover from the rejected lane and do not choose the rejected current track or artist unless explicitly required.',
       'The cold_open must introduce play[0] specifically. If you mention a title or artist, it must come from play[0].',
@@ -229,6 +274,8 @@ function buildColdOpenForTracksPrompt({ programTitle = '', tracks = [], userInpu
       'Return only: {"segments":[...],"reason":"internal reason"}.',
       djLanguageInstruction(normalizedLanguage, 'cold_open segment text'),
       hostModeInstruction(normalizedHostMode),
+      relationshipMemoryInstruction(normalizedLanguage),
+      subjectiveListeningInstruction(normalizedLanguage),
       'The opening is for trackIndex 0 and must introduce the first confirmed playable track.',
       leadInText
         ? 'Continue after the already-aired first sentence. Do not repeat or paraphrase that sentence.'
@@ -266,6 +313,7 @@ function buildMusicRefillPrompt({ programTitle = '', currentTrack = null, queue 
       'Strictly output JSON only, with no extra text.',
       'Return only: {"play":["song - artist"],"reason":"internal reason"}.',
       hostModeInstruction(normalizedHostMode),
+      relationshipMemoryInstruction('en'),
       `Return ${count} songs unless the queue context makes fewer safer.`,
       'Use the current program arc to continue the set instead of making an unrelated recommendation jump.',
       'Do not include segments, say, intros, or listener-facing explanations.',
@@ -295,6 +343,8 @@ function buildBridgePrompt({ programTitle = '', afterTrack, beforeTrack, afterTr
       'Strictly output JSON only, with no extra text.',
       djLanguageInstruction(normalizedLanguage, 'bridge segment text'),
       hostModeInstruction(normalizedHostMode),
+      relationshipMemoryInstruction(normalizedLanguage),
+      subjectiveListeningInstruction(normalizedLanguage),
       'Return only {"segments":[...],"reason":"internal reason"}.',
       'Output either 1-3 sentence-level bridge segments OR one silence segment.',
       'For bridge segments, use the same groupId, position between_tracks, and exact afterTrackIndex/beforeTrackIndex provided.',
